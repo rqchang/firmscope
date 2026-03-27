@@ -113,7 +113,7 @@ Usage
   python import_funding.py --start 1990 --end 2025
   python import_funding.py --bea_key YOUR_KEY --census_key YOUR_KEY --workers 8
   python import_funding.py --start 2020 --end 2020 --force
-  python data_import/import_funding.py --start 1990 --end 2025 --panel_only --usaspending
+  python data_import/import_funding.py --start 1990 --end 2025 --panel_only --usaspending --force
 
 API keys (all free)
 -------------------
@@ -482,44 +482,39 @@ USASPENDING_BASE = "https://api.usaspending.gov/api/v2"
 USA_SPENDING_MIN_YEAR = 2008   # API earliest: start_date 2007-10-01 = FY2008
 
 
-def fetch_usaspending_state_year(
-    state_abbr: str,
-    year: int,
+def fetch_usaspending_by_year(
+    year: int, raw_dir: Path, force: bool = False
 ) -> pd.DataFrame:
     """
-    Fetch federal assistance (grants) for *state_abbr* in fiscal year *year*
-    from USASpending.gov. Keeps only R&D / innovation-related CFDA programs.
-    Coverage: FY2008 onwards (API limit); earlier years return empty.
+    Fetch all USASpending financial assistance grants nationally for *year*,
+    post-filter to DOE (81.*) and DARPA (12.*) only — excluding NSF (47.*)
+    and NIH (93.*) already captured in Steps 1-2. State is extracted from the
+    'recipient_location_state_code' response field. One paginated call stream
+    per year instead of 51 per-state calls. Coverage: FY2008 onwards.
     """
+    out_path = raw_dir / f"usaspending_{year}.csv"
+    if out_path.exists() and not force:
+        print(f"  USASpending {year}: cached ({out_path.name})")
+        return pd.read_csv(out_path)
+
     if year < USA_SPENDING_MIN_YEAR:
         return pd.DataFrame()
 
-    fips = STATES_FIPS.get(state_abbr)
-    if fips is None:
-        return pd.DataFrame()
-
-    all_rows: list[dict] = []
-    seen_ids: set[str] = set()
-    time_period = [{"start_date": f"{year-1}-10-01", "end_date": f"{year}-09-30"}]
-    base_fields = [
-        "Award ID", "Recipient Name", "Award Amount",
-        "CFDA Number", "CFDA Title", "Award Type",
-        "Start Date", "End Date",
-    ]
-
-    # Fetch all financial assistance grants for this state-year, then
-    # post-filter by CFDA prefix to keep DOE (81.*) and DARPA (12.) only,
-    # excluding NSF (47.*) and NIH (93.*) already captured in Steps 1-2.
     KEEP_PREFIXES = ("81.", "12.")
     EXCLUDE_PREFIXES = ("47.", "93.")
 
+    all_rows: list[dict] = []
+    seen_ids: set[str] = set()
     payload: dict = {
         "filters": {
-            "time_period": time_period,
-            "recipient_locations": [{"country": "US", "state": state_abbr}],
+            "time_period": [{"start_date": f"{year-1}-10-01", "end_date": f"{year}-09-30"}],
             "award_type_codes": ["02", "03", "04", "05", "F001", "F002"],
         },
-        "fields": base_fields,
+        "fields": [
+            "Award ID", "Recipient Name", "Award Amount",
+            "CFDA Number", "CFDA Title", "Award Type",
+            "Start Date", "recipient_location_state_code",
+        ],
         "limit": 100,
         "page": 1,
         "sort": "Award Amount",
@@ -534,72 +529,40 @@ def fetch_usaspending_state_year(
         if not results:
             break
         for row in results:
-            aid = row.get("Award ID") or ""
-            if aid in seen_ids:
-                continue
             cfda = (row.get("CFDA Number") or "")
-            # Keep DOE/DARPA; skip NSF/NIH and unrelated agencies
             if not any(cfda.startswith(p) for p in KEEP_PREFIXES):
                 continue
             if any(cfda.startswith(p) for p in EXCLUDE_PREFIXES):
                 continue
+            aid = row.get("Award ID") or ""
+            if aid in seen_ids:
+                continue
             seen_ids.add(aid)
             all_rows.append({
-                "state": state_abbr,
-                "year": year,
-                "award_id": aid,
-                "recipient": row.get("Recipient Name"),
-                "amount_usd": row.get("Award Amount"),
+                "state":       row.get("recipient_location_state_code", ""),
+                "year":        year,
+                "award_id":    aid,
+                "recipient":   row.get("Recipient Name"),
+                "amount_usd":  row.get("Award Amount"),
                 "cfda_number": cfda,
-                "cfda_title": row.get("CFDA Title"),
-                "award_type": row.get("Award Type"),
-                "start_date": row.get("Start Date"),
-                "rd_tier": "direct",
+                "cfda_title":  row.get("CFDA Title"),
+                "award_type":  row.get("Award Type"),
+                "start_date":  row.get("Start Date"),
+                "rd_tier":     "direct",
             })
         pagination = data.get("page_metadata", {})
         if payload["page"] >= pagination.get("last_page", 1):
             break
         payload["page"] += 1
 
-    return pd.DataFrame(all_rows)
-
-
-def fetch_usaspending_by_year(
-    year: int, raw_dir: Path, states: list[str], force: bool = False
-) -> pd.DataFrame:
-    """
-    Fetch USASpending DOE+DARPA grants for all states in *year*, concatenate,
-    and save to raw_dir/usaspending_{year}.csv. Skips if cached unless force=True.
-    """
-    out_path = raw_dir / f"usaspending_{year}.csv"
-    if out_path.exists() and not force:
-        print(f"  USASpending {year}: cached ({out_path.name})")
-        return pd.read_csv(out_path)
-
-    if year < USA_SPENDING_MIN_YEAR:
-        return pd.DataFrame()
-
-    state_dfs: list[pd.DataFrame] = []
-    n_ok, n_empty = 0, 0
-    for state in states:
-        df = fetch_usaspending_state_year(state, year)
-        time.sleep(2.0)   # polite gap; prevents remote connection resets
-        if df is None or df.empty:
-            n_empty += 1
-        else:
-            state_dfs.append(df)
-            n_ok += 1
-
-    print(f"  USASpending {year}: {n_ok} states with data | {n_empty} empty")
-    logger.info("USASpending %d: %d states OK | %d empty", year, n_ok, n_empty)
-
-    if not state_dfs:
-        return pd.DataFrame()
-
-    combined = pd.concat(state_dfs, ignore_index=True)
-    combined.to_csv(out_path, index=False)
-    logger.info("USASpending %d: %d rows -> %s", year, len(combined), out_path)
-    return combined
+    df = pd.DataFrame(all_rows)
+    n_states = df["state"].nunique() if not df.empty else 0
+    print(f"  USASpending {year}: {len(df):,} awards | {n_states} states")
+    logger.info("USASpending %d: %d awards | %d states -> %s",
+                year, len(df), n_states, out_path)
+    if not df.empty:
+        df.to_csv(out_path, index=False)
+    return df
 
 
 # ---------------------------------------------------------------------------
@@ -1109,10 +1072,10 @@ def main():
         print("\n[Step 3] USASpending: skipped (--panel_only)")
     elif args.usaspending:
         usa_years = [y for y in years if y >= USA_SPENDING_MIN_YEAR]
-        print(f"\n[Step 3] USASpending  ({len(args.states)} states x {len(usa_years)} years, "
-              f"FY{USA_SPENDING_MIN_YEAR}-{years[-1]}; pre-{USA_SPENDING_MIN_YEAR} skipped)")
+        print(f"\n[Step 3] USASpending  ({len(usa_years)} years, "
+              f"FY{USA_SPENDING_MIN_YEAR}-{years[-1]}; national fetch, DOE+DARPA only)")
         for year in tqdm(usa_years, desc="  USASpending"):
-            df = fetch_usaspending_by_year(year, dirs["raw_usa"], args.states, force=args.force)
+            df = fetch_usaspending_by_year(year, dirs["raw_usa"], force=args.force)
             if not df.empty:
                 usaspending_dfs.append(df)
         if usaspending_dfs:
