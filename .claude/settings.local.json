@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/Dropbox/project/firmscope/data/processed/eip/**)",
+      "Bash(python3 -c \":*)"
+    ]
+  }
+}

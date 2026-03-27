@@ -30,8 +30,9 @@ USASpending covers the remaining agencies (DOE, DARPA) not in Steps 1-2.
                                  (CFDA 81.*, 12.910); NSF/NIH excluded to
                                  prevent double-counting; optional, slow;
                                  API coverage: FY2008 onwards only
-  4. BEA Regional API         – Gross State Product for GSP normalization
-  5. U.S. Census PEP API      – State population for per-capita normalization
+  4. BEA Regional API         – Gross State Product (SAGDP9) for GSP normalization
+                                 and state population (SAINC1 Line 2) for per-capita
+                                 normalization; coverage: 1969 onwards
 
 Directory layout
 ----------------
@@ -39,8 +40,8 @@ Directory layout
     NSF/                nsf_{year}.csv          one row per award
     NIH/                nih_{year}.csv          one row per project
     USASpending/        usaspending_{year}.csv  one row per grant (all states)
-    BEA/                gsp_panel.csv           state x year GSP
-    Census/             population_panel.csv    state x year population
+    BEA/                gsp_panel.csv           state x year GSP (BEA SAGDP9)
+                        population_panel.csv    state x year population (BEA SAINC1)
 
   PROC_DIR/eip/
     funding_panel.csv            primary (state, year) panel -- see schema below
@@ -84,12 +85,12 @@ Output schemas
   RAW_DIR/funding/BEA/gsp_panel.csv
     state           str    2-letter state abbreviation
     year            int    calendar year
-    gsp_millions    float  real GDP in chained dollars (millions) -- BEA SAGDP2N Line 1
+    gsp_millions    float  real GDP in chained 2017 dollars (millions) -- BEA SAGDP9 Line 1
 
-  RAW_DIR/funding/Census/population_panel.csv
+  RAW_DIR/funding/BEA/population_panel.csv
     state           str    2-letter state abbreviation
     year            int    calendar year
-    population      int    resident population estimate (Census PEP)
+    population      int    resident population -- BEA SAINC1 Line 2 (1969-2024)
 
   PROC_DIR/eip/funding_panel.csv  <- primary output for EIP construction
     state                     str    2-letter state abbreviation
@@ -99,8 +100,8 @@ Output schemas
     usaspending_rd_grants_usd float  DOE + DARPA grants only ($); 0 if skipped
     nsf_{domain}_usd          float  NSF grants by HJT domain (9 columns)
     nih_{domain}_usd          float  NIH grants by HJT domain (9 columns)
-    gsp_millions              float  real GSP in chained dollars (millions); NaN if no BEA key
-    population                int    resident population; NaN if no Census key
+    gsp_millions              float  real GSP in chained 2017 dollars (millions); NaN if no BEA key
+    population                int    resident population; NaN if no BEA key
     total_rd_funding_usd      float  NSF + NIH + DOE/DARPA, non-overlapping ($)
     rd_funding_pct_gsp        float  total_rd_funding_usd / (gsp_millions * 1e6)
     rd_funding_per_capita     float  total_rd_funding_usd / population ($)
@@ -111,19 +112,19 @@ Output schemas
 Usage
 -----
   python import_funding.py --start 1990 --end 2025
-  python import_funding.py --bea_key YOUR_KEY --census_key YOUR_KEY --workers 8
+  python import_funding.py --bea_key YOUR_KEY --workers 8
   python import_funding.py --start 2020 --end 2020 --force
-  python data_import/import_funding.py --start 1990 --end 2025 --panel_only --usaspending --force
+  python data_import/import_funding.py --start 1990 --end 2025 --panel_only --force
 
 API keys (all free)
 -------------------
   BEA:    https://apps.bea.gov/API/signup/        -> env var BEA_API_KEY
-  Census: https://api.census.gov/data/key_signup.html -> env var CENSUS_API_KEY
   NSF / NIH / USASpending: no key required
 
 Requirements
 ------------
   pip install requests pandas tqdm
+  it takes ~ 4 hrs to run this script
 """
 
 import argparse
@@ -138,6 +139,12 @@ from typing import Optional
 import pandas as pd
 import requests
 from tqdm import tqdm
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------------------
 # Path setup – resolve project root and load shared path config
@@ -356,7 +363,7 @@ def setup_dirs() -> dict[str, Path]:
         "raw_nih":    Path(RAW_DIR) / "funding" / "NIH",
         "raw_usa":    Path(RAW_DIR) / "funding" / "USASpending",
         "raw_bea":    Path(RAW_DIR) / "funding" / "BEA",
-        "raw_census": Path(RAW_DIR) / "funding" / "Census",
+        "raw_census": Path(RAW_DIR) / "funding" / "BEA",
         "proc_eip":   Path(PROC_DIR) / "eip",
     }
     for name, path in dirs.items():
@@ -482,33 +489,24 @@ USASPENDING_BASE = "https://api.usaspending.gov/api/v2"
 USA_SPENDING_MIN_YEAR = 2008   # API earliest: start_date 2007-10-01 = FY2008
 
 
-def fetch_usaspending_by_year(
-    year: int, raw_dir: Path, force: bool = False
-) -> pd.DataFrame:
+def _fetch_usaspending_agency(
+    year: int,
+    agency_filter: dict,
+    seen_ids: set,
+    all_rows: list,
+) -> None:
     """
-    Fetch all USASpending financial assistance grants nationally for *year*,
-    post-filter to DOE (81.*) and DARPA (12.*) only — excluding NSF (47.*)
-    and NIH (93.*) already captured in Steps 1-2. State is extracted from the
-    'recipient_location_state_code' response field. One paginated call stream
-    per year instead of 51 per-state calls. Coverage: FY2008 onwards.
+    Paginate through spending_by_award for a single agency filter, appending
+    deduplicated rows to all_rows. The API's `agencies` filter is AND-ed when
+    multiple entries are present, so callers must invoke this once per agency.
+    Pagination uses `hasNext` (the API dropped `last_page` from page_metadata).
     """
-    out_path = raw_dir / f"usaspending_{year}.csv"
-    if out_path.exists() and not force:
-        print(f"  USASpending {year}: cached ({out_path.name})")
-        return pd.read_csv(out_path)
-
-    if year < USA_SPENDING_MIN_YEAR:
-        return pd.DataFrame()
-
-    KEEP_PREFIXES = ("81.", "12.")
     EXCLUDE_PREFIXES = ("47.", "93.")
-
-    all_rows: list[dict] = []
-    seen_ids: set[str] = set()
     payload: dict = {
         "filters": {
             "time_period": [{"start_date": f"{year-1}-10-01", "end_date": f"{year}-09-30"}],
-            "award_type_codes": ["02", "03", "04", "05", "F001", "F002"],
+            "award_type_codes": ["02", "03", "04", "05"],
+            "agencies": [agency_filter],
         },
         "fields": [
             "Award ID", "Recipient Name", "Award Amount",
@@ -530,16 +528,17 @@ def fetch_usaspending_by_year(
             break
         for row in results:
             cfda = (row.get("CFDA Number") or "")
-            if not any(cfda.startswith(p) for p in KEEP_PREFIXES):
-                continue
             if any(cfda.startswith(p) for p in EXCLUDE_PREFIXES):
+                continue
+            state = row.get("recipient_location_state_code") or ""
+            if state not in STATES_FIPS:
                 continue
             aid = row.get("Award ID") or ""
             if aid in seen_ids:
                 continue
             seen_ids.add(aid)
             all_rows.append({
-                "state":       row.get("recipient_location_state_code", ""),
+                "state":       state,
                 "year":        year,
                 "award_id":    aid,
                 "recipient":   row.get("Recipient Name"),
@@ -550,10 +549,43 @@ def fetch_usaspending_by_year(
                 "start_date":  row.get("Start Date"),
                 "rd_tier":     "direct",
             })
-        pagination = data.get("page_metadata", {})
-        if payload["page"] >= pagination.get("last_page", 1):
+        if not data.get("page_metadata", {}).get("hasNext", False):
             break
         payload["page"] += 1
+
+
+def fetch_usaspending_by_year(
+    year: int, raw_dir: Path, force: bool = False
+) -> pd.DataFrame:
+    """
+    Fetch all USASpending financial assistance grants nationally for *year*
+    from DOE (funding toptier) and DARPA (awarding subtier). The agencies
+    filter is AND-ed when multiple entries are listed, so DOE and DARPA are
+    fetched in separate paginated call streams and merged. Pagination uses
+    hasNext (the API dropped last_page from page_metadata). Coverage: FY2008+.
+    """
+    out_path = raw_dir / f"usaspending_{year}.csv"
+    if out_path.exists() and not force:
+        print(f"  USASpending {year}: cached ({out_path.name})")
+        return pd.read_csv(out_path)
+
+    if year < USA_SPENDING_MIN_YEAR:
+        return pd.DataFrame()
+
+    all_rows: list[dict] = []
+    seen_ids: set[str] = set()
+
+    _fetch_usaspending_agency(
+        year,
+        {"type": "funding", "tier": "toptier", "name": "Department of Energy"},
+        seen_ids, all_rows,
+    )
+    _fetch_usaspending_agency(
+        year,
+        {"type": "awarding", "tier": "subtier",
+         "name": "Defense Advanced Research Projects Agency"},
+        seen_ids, all_rows,
+    )
 
     df = pd.DataFrame(all_rows)
     n_states = df["state"].nunique() if not df.empty else 0
@@ -732,17 +764,21 @@ def fetch_nih_by_year(
 BEA_API = "https://apps.bea.gov/api/data"
 
 
-def fetch_gsp(years: list[int], bea_key: str, raw_dir: Path) -> pd.DataFrame:
+def fetch_gsp(years: list[int], bea_key: str, raw_dir: Path, force: bool = False) -> pd.DataFrame:
     """
-    Fetch real Gross State Product (chained dollars) from BEA for all states.
-    Table: SAGDP2N, Line 1 = All industry total. Saves to RAW_DIR/funding/BEA/.
+    Fetch real Gross State Product (chained 2017 dollars) from BEA for all states.
+    Table: SAGDP9, Line 1 = All industry total. Saves to RAW_DIR/funding/BEA/.
     """
+    out_path = raw_dir / "gsp_panel.csv"
+    if out_path.exists() and not force:
+        print(f"  BEA GSP: cached ({out_path.name})")
+        return pd.read_csv(out_path)
     year_str = ",".join(str(y) for y in years)
     params = {
         "UserID": bea_key,
         "method": "GetData",
         "DataSetName": "Regional",
-        "TableName": "SAGDP2N",
+        "TableName": "SAGDP9",   # real GDP by state, chained 2017$; SAGDP2N no longer valid
         "LineCode": "1",
         "GeoFips": "STATE",
         "Year": year_str,
@@ -763,7 +799,7 @@ def fetch_gsp(years: list[int], bea_key: str, raw_dir: Path) -> pd.DataFrame:
     rows = []
     for r in results:
         state_fips = r.get("GeoFips", "")
-        state_abbr = FIPS_TO_STATE.get(state_fips.zfill(2))
+        state_abbr = FIPS_TO_STATE.get(state_fips[:2])
         if state_abbr is None:
             continue
         try:
@@ -785,56 +821,63 @@ def fetch_gsp(years: list[int], bea_key: str, raw_dir: Path) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# 5. Census API – State Population
+# 5. BEA SAINC1 – State Population
 # ---------------------------------------------------------------------------
 CENSUS_POP_API = "https://api.census.gov/data"
 
 
-def fetch_population(years: list[int], census_key: str, raw_dir: Path) -> pd.DataFrame:
+def fetch_population(years: list[int], bea_key: str, raw_dir: Path, force: bool = False) -> pd.DataFrame:
     """
-    Fetch state population estimates from Census Bureau (PEP series).
-    Saves to RAW_DIR/funding/Census/population_panel.csv.
+    Fetch state population from BEA SAINC1 Line 2 (1969-2024).
+    Using BEA instead of Census PEP avoids fragmented Census API endpoints
+    and gives consistent coverage from 1969 onward from a single call.
+    Saves to RAW_DIR/funding/BEA/population_panel.csv.
     """
-    rows: list[dict] = []
-    print("  Census: fetching population...", end="", flush=True)
+    out_path = raw_dir / "population_panel.csv"
+    if out_path.exists() and not force:
+        print(f"  Population: cached ({out_path.name})")
+        return pd.read_csv(out_path)
 
-    for year in years:
-        if year >= 2020:
-            url = f"{CENSUS_POP_API}/{year}/pep/population"
-            params = {
-                "get": "NAME,POP_2021" if year >= 2021 else "NAME,POP",
-                "for": "state:*",
-                "key": census_key,
-            }
-        elif year >= 2010:
-            url = f"{CENSUS_POP_API}/{year}/pep/population"
-            params = {"get": "NAME,POP", "for": "state:*", "key": census_key}
-        else:
-            url = f"{CENSUS_POP_API}/2000/pep/int_population"
-            params = {"get": "POP,DATE_DESC,NAME", "for": "state:*", "key": census_key}
+    year_str = ",".join(str(y) for y in years)
+    params = {
+        "UserID": bea_key,
+        "method": "GetData",
+        "DataSetName": "Regional",
+        "TableName": "SAINC1",
+        "LineCode": "2",
+        "GeoFips": "STATE",
+        "Year": year_str,
+        "ResultFormat": "JSON",
+    }
+    print("  BEA population (SAINC1 L2): fetching...", end="", flush=True)
+    data = get_json(BEA_API, params)
+    if data is None:
+        print(" FAILED")
+        return pd.DataFrame()
 
-        data = get_json(url, params)
-        time.sleep(SLEEP)
-        if data is None or not isinstance(data, list) or len(data) < 2:
+    try:
+        results = data["BEAAPI"]["Results"]["Data"]
+    except (KeyError, TypeError):
+        print(f" Error parsing BEA response: {data}")
+        return pd.DataFrame()
+
+    rows = []
+    for r in results:
+        state_fips = r.get("GeoFips", "")
+        state_abbr = FIPS_TO_STATE.get(state_fips[:2])
+        if state_abbr is None:
             continue
-        header = data[0]
-        for row in data[1:]:
-            row_dict = dict(zip(header, row))
-            fips = row_dict.get("state", "")
-            state = FIPS_TO_STATE.get(fips)
-            if state is None:
-                continue
-            pop_val = row_dict.get("POP") or row_dict.get("POP_2021")
-            if pop_val is None:
-                continue
-            try:
-                rows.append({"state": state, "year": year, "population": int(pop_val)})
-            except ValueError:
-                continue
+        try:
+            rows.append({
+                "state": state_abbr,
+                "year": int(r["TimePeriod"]),
+                "population": int(float(r["DataValue"].replace(",", ""))),
+            })
+        except (ValueError, AttributeError):
+            continue
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        out_path = raw_dir / "population_panel.csv"
         df.to_csv(out_path, index=False)
         print(f" {len(df)} rows | years {df['year'].min()}-{df['year'].max()}")
     return df
@@ -985,10 +1028,6 @@ def main():
         "--bea_key", type=str, default=os.environ.get("BEA_API_KEY", ""),
         help="BEA API key (free: https://apps.bea.gov/API/signup/ or set BEA_API_KEY)",
     )
-    parser.add_argument(
-        "--census_key", type=str, default=os.environ.get("CENSUS_API_KEY", ""),
-        help="Census API key (free: https://api.census.gov/data/key_signup.html or set CENSUS_API_KEY)",
-    )
     parser.add_argument("--states", nargs="*", default=list(STATES_FIPS.keys()))
     parser.add_argument(
         "--usaspending", action="store_true",
@@ -1069,7 +1108,12 @@ def main():
     # ---------------------------------------------------------- USASpending
     usaspending_dfs: list[pd.DataFrame] = []
     if args.panel_only and not args.usaspending:
-        print("\n[Step 3] USASpending: skipped (--panel_only)")
+        print("\n[Step 3] USASpending: loading from cache...")
+        for p in sorted(dirs["raw_usa"].glob("usaspending_*.csv")):
+            df = pd.read_csv(p)
+            if not df.empty:
+                usaspending_dfs.append(df)
+        print(f"  Loaded {len(usaspending_dfs)} year files from {dirs['raw_usa']}")
     elif args.usaspending:
         usa_years = [y for y in years if y >= USA_SPENDING_MIN_YEAR]
         print(f"\n[Step 3] USASpending  ({len(usa_years)} years, "
@@ -1087,19 +1131,29 @@ def main():
 
     # --------------------------------------------------------------- BEA GSP
     gsp_df = pd.DataFrame()
-    if args.bea_key:
+    gsp_cache = dirs["raw_bea"] / "gsp_panel.csv"
+    if args.panel_only and not args.force and gsp_cache.exists():
+        print("\n[Step 4] BEA GSP: loading from cache...")
+        gsp_df = pd.read_csv(gsp_cache)
+        print(f"  Loaded {len(gsp_df)} rows from {gsp_cache.name}")
+    elif args.bea_key:
         print("\n[Step 4] BEA Gross State Product")
-        gsp_df = fetch_gsp(years, args.bea_key, dirs["raw_bea"])
+        gsp_df = fetch_gsp(years, args.bea_key, dirs["raw_bea"], force=args.force)
     else:
         print("\n[Step 4] BEA: skipped (no key — set BEA_API_KEY or pass --bea_key)")
 
     # ------------------------------------------------------------ Population
     pop_df = pd.DataFrame()
-    if args.census_key:
-        print("\n[Step 5] Census population")
-        pop_df = fetch_population(years, args.census_key, dirs["raw_census"])
+    pop_cache = dirs["raw_census"] / "population_panel.csv"
+    if args.panel_only and not args.force and pop_cache.exists():
+        print("\n[Step 5] Population: loading from cache...")
+        pop_df = pd.read_csv(pop_cache)
+        print(f"  Loaded {len(pop_df)} rows from {pop_cache.name}")
+    elif args.bea_key:
+        print("\n[Step 5] Population (BEA SAINC1 Line 2)")
+        pop_df = fetch_population(years, args.bea_key, dirs["raw_census"], force=args.force)
     else:
-        print("\n[Step 5] Census: skipped (no key — set CENSUS_API_KEY or pass --census_key)")
+        print("\n[Step 5] Population: skipped (no BEA key — set BEA_API_KEY or pass --bea_key)")
 
     # --------------------------------------------------------------- Panel
     print("\n[Step 6] Building processed panel -> PROC_DIR/eip/funding_panel.csv")
