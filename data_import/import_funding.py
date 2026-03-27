@@ -1,8 +1,10 @@
 """
 import_funding.py
 -----------------
-Pulls state-level innovation-oriented public funding data for EIP Component 3:
-Innovation Funding Intensity (Fund_{s,t}).
+Fetches raw grant-level data from federal APIs (NSF, NIH, USASpending, BEA)
+and tags each award with domain, recipient type, and research-grant flag.
+Saves one CSV per source per year to RAW_DIR/funding/. Does NOT aggregate.
+Run aggregate_funding.py after this to build the research panel.
 
 Conceptual basis
 ----------------
@@ -13,8 +15,55 @@ experimental development). CFDA program selection follows:
   - Azoulay, Graff Zivin, Li, Sampat (2019, REStud): NIH IC/study-section
     structure as the unit of R&D classification.
   - NSF Survey of Federal Funds for R&D (NCSES): agency-level budget data.
-Innovation domain tags follow Hall, Jaffe, Trajtenberg (2001, NBER WP 8498)
-HJT patent technology taxonomy (6 categories).
+  
+Innovation Domain Classification
+---------------------------------
+Domain tags are built on Hall, Jaffe, Trajtenberg (2001, NBER WP 8498) — the
+standard patent technology taxonomy used in the innovation literature — and
+extended in two ways to suit grant (rather than patent) text and to reflect
+the modern R&D landscape.
+
+HJT foundation (6 original categories mapped to our labels):
+  HJT "Computers & Communications"  → it_digital
+  HJT "Drugs & Medical"             → biotech_health
+  HJT "Chemical"                    → materials_mfg (partial)
+  HJT "Electrical & Electronic"     → it_digital / materials_mfg (partial)
+  HJT "Mechanical"                  → materials_mfg (partial)
+  HJT "Other"                       → aerospace_space, basic_science,
+                                       social_science
+
+Extension 1 — granular decomposition of HJT "Drugs & Medical":
+  The HJT Drugs & Medical bucket is far too coarse for NIH data, where
+  ~60-70% of grants would otherwise fall into "other". We split it into:
+    neuroscience    — brain, behavior, psychiatric (NIMH, NINDS, NIDA)
+    biotech_health  — molecular biology, genomics, drug discovery (NCI, NIAID)
+    clinical_health — clinical trials, epidemiology, population health
+                      (NHLBI, NIA, NICHD, and cross-IC programs)
+  Boundary rule: neuroscience keywords take priority over biotech_health
+  (ordered first); clinical_health picks up disease-management grants
+  that lack molecular/genomic language.
+
+Extension 2 — AI / ML as a standalone domain:
+  HJT predates the modern ML era and subsumes AI under "Computers &
+  Communications". Given AI's central role in contemporary innovation
+  and its distinct spillover profile (general-purpose technology with
+  cross-domain application), we separate it:
+    ai_ml      — artificial intelligence, machine learning, deep learning,
+                 LLMs, computer vision, NLP, autonomous systems
+    it_digital — remaining IT/computing grants without AI language
+  ai_ml is evaluated before it_digital (first-match wins) to prevent
+  AI-heavy grants from being absorbed into the broader IT bucket.
+
+Classification procedure:
+  For NSF: CFDA program code → deterministic domain map (NSF_CFDA_DOMAIN)
+           takes priority; keyword matching on title is the fallback.
+  For NIH and USASpending: keyword matching on grant title / CFDA title
+           only (no reliable program-code-to-domain map exists).
+  Ordering: sbir_sttr → ai_ml → it_digital → clean_energy → neuroscience
+            → biotech_health → clinical_health → materials_mfg
+            → aerospace_space → basic_science → social_science → other
+  The "other" residual captures grants whose titles contain none of the
+  domain keywords; shrinking this residual motivated Extensions 1 and 2.
 
 Data sources (all public)
 -----------------------------------
@@ -42,10 +91,7 @@ Directory layout
     USASpending/        usaspending_{year}.csv  one row per grant (all states)
     BEA/                gsp_panel.csv           state x year GSP (BEA SAGDP9)
                         population_panel.csv    state x year population (BEA SAINC1)
-
-  PROC_DIR/eip/
-    funding_panel.csv            primary (state, year) panel -- see schema below
-    import_funding_{ts}.log      run log with fetch stats and errors
+    logs/               import_funding_{ts}.log run log with fetch stats and errors
 
 Output schemas
 --------------
@@ -57,17 +103,20 @@ Output schemas
     awardee         str    recipient organization
     cfda            str    CFDA program code (e.g. "47.070")
     domain          str    HJT innovation domain (see INNOVATION_DOMAINS)
+    recipient_type  str    university | hospital | national_lab | firm | other
     amount_usd      float  obligated amount in USD
     start_date      str    award start date (MM/DD/YYYY)
 
   RAW_DIR/funding/NIH/nih_{year}.csv
-    nih_id          str    NIH project number (e.g. R01CA123456)
-    state           str    2-letter state abbreviation
-    year            int    fiscal year
-    activity_code   str    NIH activity code (R01, R21, P01, U01, ...)
-    title           str    project title (truncated to 200 chars)
-    domain          str    HJT innovation domain
-    amount_usd      float  award amount in USD
+    nih_id            str    NIH project number (e.g. R01CA123456)
+    state             str    2-letter state abbreviation
+    year              int    fiscal year (Oct-Sep; FY aligned)
+    activity_code     str    NIH activity code (R01, R21, P01, U01, ...)
+    title             str    project title (truncated to 200 chars)
+    domain            str    HJT innovation domain
+    recipient_type    str    university | hospital | national_lab | firm | other
+    is_research_grant bool   True for R/P/U/DP series; False for K/T training awards
+    amount_usd        float  award amount in USD
 
   RAW_DIR/funding/USASpending/usaspending_{year}.csv
                               Note: FY2008+ only (API limit: start_date >= 2007-10-01)
@@ -75,6 +124,8 @@ Output schemas
     year            int    fiscal year (Oct-Sep); FY2008-FY2025 only
     award_id        str    USASpending award ID
     recipient       str    recipient organization name
+    recipient_type  str    university | hospital | national_lab | firm | other
+    domain          str    HJT innovation domain (from cfda_title keyword match)
     amount_usd      float  award amount in USD
     cfda_number     str    CFDA program number (DOE/DARPA codes only)
     cfda_title      str    CFDA program title
@@ -92,33 +143,30 @@ Output schemas
     year            int    calendar year
     population      int    resident population -- BEA SAINC1 Line 2 (1969-2024)
 
-  PROC_DIR/eip/funding_panel.csv  <- primary output for EIP construction
-    state                     str    2-letter state abbreviation
-    year                      int    calendar/fiscal year
-    nsf_grants_usd            float  total NSF obligations, all directorates ($)
-    nih_grants_usd            float  total NIH awards, all ICs ($)
-    usaspending_rd_grants_usd float  DOE + DARPA grants only ($); 0 if skipped
-    nsf_{domain}_usd          float  NSF grants by HJT domain (9 columns)
-    nih_{domain}_usd          float  NIH grants by HJT domain (9 columns)
-    gsp_millions              float  real GSP in chained 2017 dollars (millions); NaN if no BEA key
-    population                int    resident population; NaN if no BEA key
-    total_rd_funding_usd      float  NSF + NIH + DOE/DARPA, non-overlapping ($)
-    rd_funding_pct_gsp        float  total_rd_funding_usd / (gsp_millions * 1e6)
-    rd_funding_per_capita     float  total_rd_funding_usd / population ($)
-      HJT domains (9): sbir_sttr | it_digital | clean_energy | biotech_health |
-                       materials_mfg | aerospace_space | basic_science |
-                       social_science | other
-
 Usage
 -----
-  python import_funding.py --start 1990 --end 2025
-  python import_funding.py --bea_key YOUR_KEY --workers 8
-  python import_funding.py --start 2020 --end 2020 --force
-  python data_import/import_funding.py --start 1990 --end 2025 --panel_only --force
+  # Most common: re-tag existing raw CSVs after updating INNOVATION_DOMAINS
+  # (does NOT re-fetch from APIs; rewrites domain/recipient_type/is_research_grant in place)
+  python data_import/import_funding.py --retag
+
+  # Full fetch from scratch (NSF + NIH, ~4 hrs)
+  python data_import/import_funding.py --start 1990 --end 2025 --workers 8
+
+  # Include DOE + DARPA via USASpending (adds ~1-2 hrs)
+  python data_import/import_funding.py --start 1990 --end 2025 --usaspending
+
+  # Fetch BEA GSP + population (requires free API key)
+  python data_import/import_funding.py --start 1990 --end 2025 --bea_key YOUR_KEY
+
+  # Re-fetch specific years only
+  python data_import/import_funding.py --start 2023 --end 2025 --force
+
+  # Then aggregate:
+  python data_setup/eip/aggregate_funding.py --fy_shift 1 --research_only --bartik_base_end 2000
 
 API keys (all free)
 -------------------
-  BEA:    https://apps.bea.gov/API/signup/        -> env var BEA_API_KEY
+  BEA:    https://apps.bea.gov/API/signup/  -> env var BEA_API_KEY
   NSF / NIH / USASpending: no key required
 
 Requirements
@@ -297,42 +345,154 @@ NSF_CFDA_DOMAIN: dict[str, str] = {
     "47.074": "biotech_health",  # Biological Sciences
     "47.075": "social_science",  # Social, Behavioral & Economic Sciences
     "47.076": "social_science",  # STEM Education
-    "47.079": "other",           # International Science & Engineering
-    "47.083": "other",           # Office of Integrative Activities
+    "47.079": "basic_science",   # International Science & Engineering
+    "47.083": "basic_science",   # Office of Integrative Activities
+    # DOE CFDA codes (deterministic by statute)
+    "81.049": "basic_science",   # DOE Office of Science
+    "81.051": "clean_energy",    # Energy Efficiency & Renewable Energy
+    "81.057": "clean_energy",    # Fossil Energy R&D
+    "81.135": "sbir_sttr",       # DOE SBIR Phase I
+    "81.136": "sbir_sttr",       # DOE SBIR Phase II
 }
 
 # Title-keyword classifier (fallback for NSF; primary for NIH/USASpending).
 # Ordered: first match wins. Follows HJT 6-category structure.
 INNOVATION_DOMAINS: list[tuple[str, list[str]]] = [
-    ("sbir_sttr",      ["sbir", "sttr", "small business innovation"]),
-    ("it_digital",     ["computer", "software", "artificial intelligence",
-                        "machine learning", "cybersecurity", "broadband",
-                        "digital", "computing", "internet", "algorithm",
-                        "quantum computing", "data science", "autonomous",
-                        "information technology", "robotics"]),
-    ("clean_energy",   ["renewable", "solar", "wind energy", "electric vehicle",
-                        "battery", "hydrogen fuel", "grid modernization",
-                        "carbon capture", "climate", "nuclear energy",
-                        "fuel cell", "photovoltaic", "bioenergy",
-                        "energy efficiency", "decarbonization"]),
-    ("biotech_health", ["biology", "genomics", "biotechnology", "life science",
-                        "medicine", "health", "biomedical", "clinical",
-                        "pharmaceutical", "cancer", "disease", "neuroscience",
-                        "genetics", "immunology", "biochemistry", "molecular",
-                        "public health", "epidemiology", "drug discovery",
-                        "precision medicine", "crispr"]),
-    ("materials_mfg",  ["materials science", "semiconductor", "nanotechnology",
-                        "photonics", "manufacturing", "additive manufacturing",
-                        "composite", "polymer", "superconductor", "3d printing",
-                        "advanced materials", "metallurgy"]),
-    ("aerospace_space",["aerospace", "space", "satellite", "aviation",
-                        "launch vehicle", "propulsion", "rocket"]),
-    ("basic_science",  ["physics", "chemistry", "mathematics", "geoscience",
-                        "earth science", "astronomy", "oceanography",
-                        "atmospheric", "astrophysics", "geology"]),
-    ("social_science", ["social science", "economics", "behavioral science",
-                        "education", "workforce development", "stem education",
-                        "cognitive science"]),
+    # ---- Unambiguous program-level tags ----
+    ("sbir_sttr",      ["sbir", "sttr", "small business innovation",
+                        "small business technology transfer"]),
+
+    # ---- AI / Machine Learning ----
+    ("ai_ml",          ["artificial intelligence", "machine learning", "deep learning",
+                        "neural network", "large language model", "foundation model",
+                        "generative ai", "reinforcement learning", "computer vision",
+                        "natural language processing", "nlp", "transformer",
+                        "data science", "predictive model", "autonomous system",
+                        "autonomous vehicle", "intelligent system",
+                        "pattern recognition", "image recognition", "speech recognition",
+                        "recommendation system", "knowledge graph", "explainable ai",
+                        "ai safety", "federated learning", "diffusion model"]),
+
+    # ---- IT / Digital (non-AI) ----
+    ("it_digital",     ["computer science", "computer engineering", "software",
+                        "cybersecurity", "information security", "cryptography",
+                        "broadband", "digital", "computing", "internet",
+                        "algorithm", "quantum computing", "quantum information",
+                        "information technology", "robotics", "human-robot",
+                        "bioinformatics", "computational", "data mining",
+                        "high performance computing", "cloud computing",
+                        "distributed system", "operating system", "database",
+                        "network", "wireless", "5g", "internet of things",
+                        "augmented reality", "virtual reality", "simulation",
+                        "programming", "compiler", "embedded system",
+                        "digital twin", "blockchain", "edge computing"]),
+
+    # ---- Clean Energy / Environment ----
+    ("clean_energy",   ["renewable energy", "solar", "wind energy", "wind power",
+                        "electric vehicle", "battery", "lithium", "hydrogen",
+                        "fuel cell", "grid", "photovoltaic", "bioenergy", "biofuel",
+                        "energy efficiency", "decarbonization", "greenhouse gas",
+                        "carbon capture", "carbon sequestration", "emissions",
+                        "clean energy", "energy storage", "geothermal",
+                        "nuclear energy", "nuclear fusion", "nuclear fission",
+                        "climate change", "climate adaptation", "carbon neutral",
+                        "net zero", "smart grid", "power electronics",
+                        "environmental remediation", "water quality", "water treatment",
+                        "waste management", "circular economy", "sustainability"]),
+
+    # ---- Neuroscience ----
+    ("neuroscience",   ["neuroscience", "neurology", "brain", "neural circuit",
+                        "neural mechanism", "neuronal", "cognitive neuroscience",
+                        "psychiatric", "mental health", "mental illness",
+                        "alzheimer", "parkinson", "dementia", "epilepsy",
+                        "spinal cord", "nervous system", "neuroimaging", "fmri",
+                        "eeg", "brain stimulation", "neuromodulation",
+                        "addiction", "opioid", "substance use",
+                        "anxiety", "depression", "schizophrenia", "autism",
+                        "bipolar", "ptsd", "sleep disorder", "pain",
+                        "sensory", "motor control", "synapse", "neurotransmitter"]),
+
+    # ---- Biotech / Genomics / Drug Discovery ----
+    ("biotech_health", ["genomics", "genome", "epigenome", "transcriptome",
+                        "proteomics", "metabolomics", "biotechnology",
+                        "biomedical", "pharmaceutical", "cancer", "oncology",
+                        "tumor", "metastasis", "genetics", "genetic",
+                        "immunology", "immune", "autoimmune", "inflammation",
+                        "biochemistry", "molecular biology", "cell biology",
+                        "drug discovery", "drug development", "therapeutic",
+                        "precision medicine", "personalized medicine",
+                        "crispr", "gene editing", "gene therapy", "rna",
+                        "mrna", "cell therapy", "car-t", "vaccine", "immunotherapy",
+                        "antibody", "monoclonal", "protein structure", "enzyme",
+                        "stem cell", "regenerative medicine", "tissue engineering",
+                        "virology", "virus", "microbiology", "bacteria", "fungal",
+                        "pathogen", "infectious disease", "antimicrobial",
+                        "antibiotic", "antiviral", "biosensor", "biomarker",
+                        "sequencing", "single cell", "organoid", "microbiome"]),
+
+    # ---- Clinical / Population Health ----
+    ("clinical_health",["clinical trial", "clinical study", "clinical research",
+                        "randomized controlled", "randomized trial",
+                        "epidemiology", "public health", "population health",
+                        "health disparities", "health equity", "community health",
+                        "cardiovascular", "heart disease", "stroke", "hypertension",
+                        "diabetes", "metabolic", "obesity", "nutrition", "diet",
+                        "aging", "geriatric", "older adult", "longevity",
+                        "pediatric", "child health", "adolescent", "maternal",
+                        "reproductive health", "pregnancy", "fertility",
+                        "respiratory", "lung disease", "pulmonary", "asthma",
+                        "kidney", "renal", "liver", "hepatitis", "hepatic",
+                        "orthopedic", "musculoskeletal", "bone", "arthritis",
+                        "vision", "ophthalmology", "hearing", "audiology",
+                        "dental", "oral health", "surgery", "anesthesia",
+                        "rehabilitation", "physical therapy", "occupational therapy",
+                        "nursing", "palliative", "health services research",
+                        "health outcomes", "quality of life", "prevention",
+                        "screening", "diagnosis", "telemedicine", "mobile health",
+                        "implementation science", "dissemination"]),
+
+    # ---- Materials / Manufacturing ----
+    ("materials_mfg",  ["materials science", "advanced materials", "nanotechnology",
+                        "nanomaterial", "nanoparticle", "photonics", "optical fiber",
+                        "manufacturing", "additive manufacturing", "3d printing",
+                        "composite material", "polymer", "superconductor",
+                        "metallurgy", "alloy", "ceramic", "coating", "thin film",
+                        "biomaterials", "scaffold", "surface engineering",
+                        "microelectronics", "fabrication", "lithography",
+                        "semiconductor device", "mems", "tribology",
+                        "structural material", "corrosion", "welding"]),
+
+    # ---- Aerospace / Defense ----
+    ("aerospace_space",["aerospace", "space exploration", "satellite", "aviation",
+                        "launch vehicle", "propulsion", "rocket", "hypersonic",
+                        "unmanned aerial", "drone", "uav", "aircraft",
+                        "space debris", "orbit", "planetary", "lunar", "mars",
+                        "remote sensing", "navigation", "GPS", "radar"]),
+
+    # ---- Basic / Physical Science ----
+    ("basic_science",  ["physics", "chemistry", "mathematics", "statistics",
+                        "geoscience", "earth science", "astronomy", "astrophysics",
+                        "oceanography", "atmospheric science", "meteorology",
+                        "geology", "hydrology", "ecology", "evolution",
+                        "optics", "thermodynamics", "fluid dynamics",
+                        "particle physics", "nuclear physics", "quantum mechanics",
+                        "crystallography", "spectroscopy", "microscopy",
+                        "theoretical", "computational chemistry",
+                        "organic chemistry", "inorganic chemistry",
+                        "physical chemistry", "biochemical"]),
+
+    # ---- Social / Behavioral / Education ----
+    ("social_science", ["social science", "economics", "econometric",
+                        "behavioral science", "behavior change",
+                        "education research", "learning", "pedagogy",
+                        "workforce development", "stem education", "stem learning",
+                        "cognitive science", "psychology", "psychosocial",
+                        "sociology", "anthropology", "political science",
+                        "communication", "media", "decision making",
+                        "risk perception", "science communication",
+                        "policy research", "ethics", "equity", "justice",
+                        "poverty", "inequality", "labor market",
+                        "organizational", "management", "entrepreneurship"]),
 ]
 
 ALL_DOMAINS = [d for d, _ in INNOVATION_DOMAINS] + ["other"]
@@ -347,6 +507,55 @@ def classify_domain(text: str, cfda: str = "") -> str:
         if any(kw in t for kw in keywords):
             return domain
     return "other"
+
+
+def classify_recipient(name: str) -> str:
+    """
+    Tag recipient organization as: university | hospital | national_lab | firm | other.
+    Used to construct the leave-one-out external spillover measure in aggregate_funding.py
+    (exclude grants directly to firms, which may be the focal firm itself).
+    """
+    n = (name or "").lower()
+    if any(kw in n for kw in [
+        "university", "college", "school of", "institute of technology",
+        "polytechnic", "academia", " edu ", "\.edu",
+    ]):
+        return "university"
+    if any(kw in n for kw in [
+        "hospital", "medical center", "health system", "health sciences",
+        "clinic", "medical school", "children's", "memorial",
+    ]):
+        return "hospital"
+    if any(kw in n for kw in [
+        "national laboratory", "national lab", "argonne", "brookhaven",
+        "fermilab", "slac", "oak ridge", "sandia", "los alamos", "lawrence",
+        "pacific northwest", "ames laboratory", "nrel", "ornl", "llnl", "lbnl",
+    ]):
+        return "national_lab"
+    if any(kw in n for kw in [
+        " inc", " inc.", " llc", " corp", " corporation", " co.", " ltd",
+        " limited", " lp", "technologies", " tech ", "company", "systems inc",
+        "solutions", "enterprises", "ventures",
+    ]):
+        return "firm"
+    return "other"
+
+
+# NIH activity codes that represent investigator-initiated or center research grants.
+# K-series (career awards) and T-series (training grants) are excluded as they
+# do not represent frontier research pressure in the same sense as R/P/U grants.
+RESEARCH_ACTIVITY_CODES: set[str] = {
+    # Investigator-initiated research (R-series)
+    "R01", "R03", "R15", "R21", "R33", "R34", "R37", "R61",
+    # Program projects and centers
+    "P01", "P20", "P30", "P50",
+    # Cooperative agreements
+    "U01", "U19", "U54",
+    # NIH Director's awards
+    "DP1", "DP2", "DP5",
+    # SBIR / STTR (research by statute)
+    "R41", "R42", "R43", "R44", "U43", "U44",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +574,7 @@ def setup_dirs() -> dict[str, Path]:
         "raw_bea":    Path(RAW_DIR) / "funding" / "BEA",
         "raw_census": Path(RAW_DIR) / "funding" / "BEA",
         "proc_eip":   Path(PROC_DIR) / "eip",
+        "raw_logs":   Path(RAW_DIR) / "funding" / "logs",
     }
     for name, path in dirs.items():
         path.mkdir(parents=True, exist_ok=True)
@@ -377,8 +587,8 @@ def setup_dirs() -> dict[str, Path]:
 def setup_logging(log_dir: Path) -> None:
     """
     Configure the module logger to write to both the console and a timestamped
-    log file in log_dir (PROC_DIR/eip/).  Captures all key fetch stats and
-    errors so every run is fully reproducible from the log alone.
+    log file in log_dir (RAW_DIR/funding/logs/).  Captures all key fetch stats
+    and errors so every run is fully reproducible from the log alone.
 
     Log file: import_funding_{YYYYMMDD_HHMMSS}.log
     """
@@ -537,17 +747,21 @@ def _fetch_usaspending_agency(
             if aid in seen_ids:
                 continue
             seen_ids.add(aid)
+            recipient = row.get("Recipient Name") or ""
+            cfda_title = row.get("CFDA Title") or ""
             all_rows.append({
-                "state":       state,
-                "year":        year,
-                "award_id":    aid,
-                "recipient":   row.get("Recipient Name"),
-                "amount_usd":  row.get("Award Amount"),
-                "cfda_number": cfda,
-                "cfda_title":  row.get("CFDA Title"),
-                "award_type":  row.get("Award Type"),
-                "start_date":  row.get("Start Date"),
-                "rd_tier":     "direct",
+                "state":          state,
+                "year":           year,
+                "award_id":       aid,
+                "recipient":      recipient,
+                "recipient_type": classify_recipient(recipient),
+                "domain":         classify_domain(cfda_title, cfda),
+                "amount_usd":     row.get("Award Amount"),
+                "cfda_number":    cfda,
+                "cfda_title":     cfda_title,
+                "award_type":     row.get("Award Type"),
+                "start_date":     row.get("Start Date"),
+                "rd_tier":        "direct",
             })
         if not data.get("page_metadata", {}).get("hasNext", False):
             break
@@ -626,16 +840,18 @@ def _fetch_nsf_state(state: str, year: int) -> list[dict]:
         for award in awards:
             cfda = award.get("cfdaNumber", "")
             title = award.get("title", "")
+            awardee = award.get("awardeeName", "")
             rows.append({
-                "nsf_id":    award.get("id"),
-                "state":     state,
-                "year":      year,
-                "title":     title,
-                "awardee":   award.get("awardeeName", ""),
-                "cfda":      cfda,
-                "domain":    classify_domain(title, cfda),
-                "amount_usd": pd.to_numeric(award.get("fundsObligatedAmt", 0), errors="coerce"),
-                "start_date": award.get("startDate", ""),
+                "nsf_id":         award.get("id"),
+                "state":          state,
+                "year":           year,
+                "title":          title,
+                "awardee":        awardee,
+                "recipient_type": classify_recipient(awardee),
+                "cfda":           cfda,
+                "domain":         classify_domain(title, cfda),
+                "amount_usd":     pd.to_numeric(award.get("fundsObligatedAmt", 0), errors="coerce"),
+                "start_date":     award.get("startDate", ""),
             })
         if len(awards) < rpp:
             break
@@ -706,14 +922,19 @@ def _fetch_nih_state(state: str, year: int) -> list[dict]:
             break
         for proj in results:
             title = (proj.get("project_title") or proj.get("ProjectTitle") or "")
+            activity_code = proj.get("activity_code", "")
+            org = (proj.get("organization", {}) or {})
+            org_name = org.get("org_name", "") if isinstance(org, dict) else ""
             rows.append({
-                "nih_id":       proj.get("project_num") or proj.get("ProjectNum"),
-                "state":        state,
-                "year":         year,
-                "activity_code": proj.get("activity_code", ""),
-                "title":        title[:200],
-                "domain":       classify_domain(title),
-                "amount_usd":   pd.to_numeric(
+                "nih_id":             proj.get("project_num") or proj.get("ProjectNum"),
+                "state":              state,
+                "year":               year,
+                "activity_code":      activity_code,
+                "title":              title[:200],
+                "domain":             classify_domain(title),
+                "recipient_type":     classify_recipient(org_name),
+                "is_research_grant":  activity_code.upper() in RESEARCH_ACTIVITY_CODES,
+                "amount_usd":         pd.to_numeric(
                     proj.get("award_amount") or proj.get("AwardAmount") or 0,
                     errors="coerce",
                 ),
@@ -884,7 +1105,7 @@ def fetch_population(years: list[int], bea_key: str, raw_dir: Path, force: bool 
 
 
 # ---------------------------------------------------------------------------
-# Panel assembler  (saves intermediary output to PROC_DIR/eip/)
+# Panel assembler  -> moved to aggregate_funding.py
 # ---------------------------------------------------------------------------
 
 def build_funding_panel(
@@ -945,6 +1166,7 @@ def build_funding_panel(
     print("  [2/4] Building per-domain breakdowns (HJT taxonomy)...")
     nsf_domain = agg_by_domain(nsf_dfs, "nsf")
     nih_domain = agg_by_domain(nih_dfs, "nih")
+    usa_domain = agg_by_domain(usaspending_dfs, "usa")
 
     # Report domain distribution for a quick sanity check
     for label, dfs in [("NSF", nsf_dfs), ("NIH", nih_dfs)]:
@@ -958,7 +1180,7 @@ def build_funding_panel(
 
     print("  [3/4] Merging all sources into panel...")
     panel = usa_total
-    for df in [nsf_total, nih_total, nsf_domain, nih_domain]:
+    for df in [nsf_total, nih_total, nsf_domain, nih_domain, usa_domain]:
         panel = panel.merge(df, on=["state", "year"], how="outer")
     if not gsp_df.empty:
         panel = panel.merge(gsp_df, on=["state", "year"], how="left")
@@ -1043,7 +1265,13 @@ def main():
     )
     parser.add_argument(
         "--panel_only", action="store_true",
-        help="Skip Steps 1-3 (fetch); load existing raw CSVs and run Steps 4-6 only",
+        help="Skip Steps 1-3 (fetch); load existing raw CSVs only",
+    )
+    parser.add_argument(
+        "--retag", action="store_true",
+        help="Re-apply domain/recipient_type/is_research_grant tags to all existing "
+             "raw CSVs and overwrite them in place. Use after updating INNOVATION_DOMAINS "
+             "keywords. Does NOT re-fetch from APIs.",
     )
     args = parser.parse_args()
     years = list(range(args.start, args.end + 1))
@@ -1052,14 +1280,49 @@ def main():
     print("=" * 60)
     print("=== EIP Component 3: Innovation Funding Intensity ===")
     print("=" * 60)
-    print(f"\n[Step 0] Setting up directories ({args.start}-{args.end}, "
-          f"{len(years)} years, {len(args.states)} states)...")
     dirs = setup_dirs()
-    setup_logging(dirs["proc_eip"])
+    setup_logging(dirs["raw_logs"])
+
+    # ---------------------------------------------------------------- retag
+    if args.retag:
+        print("\n[Retag] Re-applying tags to all existing raw CSVs...")
+        retagged = 0
+        for csv_path in sorted([
+            *dirs["raw_nsf"].glob("nsf_*.csv"),
+            *dirs["raw_nih"].glob("nih_*.csv"),
+            *dirs["raw_usa"].glob("usaspending_*.csv"),
+        ]):
+            df = pd.read_csv(csv_path)
+            if df.empty:
+                continue
+            source = csv_path.stem.split("_")[0]  # nsf | nih | usaspending
+            if source == "nsf":
+                df["domain"] = df.apply(
+                    lambda r: classify_domain(str(r.get("title", "")), str(r.get("cfda", ""))),
+                    axis=1,
+                )
+                df["recipient_type"] = df["awardee"].fillna("").apply(classify_recipient)
+            elif source == "nih":
+                df["domain"] = df["title"].fillna("").apply(classify_domain)
+                df["recipient_type"] = df.get("recipient_type", pd.Series("other", index=df.index))
+                df["is_research_grant"] = (
+                    df["activity_code"].fillna("").str.upper().isin(RESEARCH_ACTIVITY_CODES)
+                )
+            elif source == "usaspending":
+                df["domain"] = df["cfda_title"].fillna("").apply(classify_domain)
+                df["recipient_type"] = df["recipient"].fillna("").apply(classify_recipient)
+            df.to_csv(csv_path, index=False)
+            retagged += 1
+        print(f"  Retagged {retagged} CSV files.")
+        print("\nDone. Now run: python data_setup/eip/aggregate_funding.py")
+        return
+
+    print(f"\n[Step 0] Fetching {args.start}-{args.end} "
+          f"({len(years)} years, {len(args.states)} states)...")
     logger.info("Run started: years=%d-%d  states=%d  workers=%d  "
-                "usaspending=%s  force=%s  panel_only=%s",
+                "usaspending=%s  force=%s",
                 args.start, args.end, len(args.states), args.workers,
-                args.usaspending, args.force, args.panel_only)
+                args.usaspending, args.force)
 
     # ------------------------------------------------------------------ NSF
     nsf_dfs: list[pd.DataFrame] = []
@@ -1112,6 +1375,8 @@ def main():
         for p in sorted(dirs["raw_usa"].glob("usaspending_*.csv")):
             df = pd.read_csv(p)
             if not df.empty:
+                if "domain" not in df.columns:
+                    df["domain"] = df["cfda_title"].fillna("").apply(classify_domain)
                 usaspending_dfs.append(df)
         print(f"  Loaded {len(usaspending_dfs)} year files from {dirs['raw_usa']}")
     elif args.usaspending:
@@ -1123,9 +1388,13 @@ def main():
             if not df.empty:
                 usaspending_dfs.append(df)
         if usaspending_dfs:
+            for df in usaspending_dfs:
+                if "domain" not in df.columns:
+                    df["domain"] = df["cfda_title"].fillna("").apply(classify_domain)
             usa_all = pd.concat(usaspending_dfs, ignore_index=True)
             print(f"  USASpending total: {len(usa_all):,} awards | "
-                  f"${usa_all['amount_usd'].sum()/1e9:.1f}B")
+                  f"${usa_all['amount_usd'].sum()/1e9:.1f}B | "
+                  f"domains: {usa_all['domain'].value_counts().to_dict()}")
     else:
         print("\n[Step 3] USASpending: skipped (pass --usaspending to enable)")
 
@@ -1155,18 +1424,9 @@ def main():
     else:
         print("\n[Step 5] Population: skipped (no BEA key — set BEA_API_KEY or pass --bea_key)")
 
-    # --------------------------------------------------------------- Panel
-    print("\n[Step 6] Building processed panel -> PROC_DIR/eip/funding_panel.csv")
-    panel = build_funding_panel(
-        usaspending_dfs, nsf_dfs, nih_dfs, gsp_df, pop_df, dirs["proc_eip"]
-    )
-    print("\n  Preview (first 5 rows, key columns):")
-    preview_cols = [c for c in ["state", "year", "nsf_grants_usd", "nih_grants_usd",
-                                "total_rd_funding_usd", "rd_funding_per_capita",
-                                "rd_funding_pct_gsp"] if c in panel.columns]
-    print(panel[preview_cols].head().to_string(index=False))
-    print("\nDone.")
-    logger.info("Run complete.")
+    print("\nDone. Raw files saved to RAW_DIR/funding/.")
+    print("Next step: python aggregate_funding.py --bartik_base_end 2000")
+    logger.info("Import run complete.")
 
 
 if __name__ == "__main__":

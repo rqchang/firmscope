@@ -21,8 +21,10 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import seaborn as sns
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from utils.set_paths import PROC_DIR, OUT_DIR
+# Works in both script and interactive (REPL) contexts
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]
+                       if "__file__" in dir() else Path.cwd().parents[1]))
+from utils.set_paths import PROC_DIR, PLOTS_DIR
 
 # ---------------------------------------------------------------------------
 # Load and clean
@@ -34,14 +36,18 @@ df = pd.read_csv(panel_path)
 df = df[df["state"].apply(lambda x: str(x).isalpha() and len(str(x)) == 2)].copy()
 
 DOMAINS = [
-    "sbir_sttr", "it_digital", "clean_energy", "biotech_health",
-    "materials_mfg", "aerospace_space", "basic_science", "social_science", "other",
+    "sbir_sttr", "ai_ml", "it_digital", "clean_energy", "neuroscience",
+    "biotech_health", "clinical_health", "materials_mfg",
+    "aerospace_space", "basic_science", "social_science", "other",
 ]
 DOMAIN_LABELS = {
     "sbir_sttr":       "SBIR/STTR",
+    "ai_ml":           "AI & ML",
     "it_digital":      "IT & Digital",
     "clean_energy":    "Clean Energy",
+    "neuroscience":    "Neuroscience",
     "biotech_health":  "Biotech & Health",
+    "clinical_health": "Clinical & Pop. Health",
     "materials_mfg":   "Materials & Mfg",
     "aerospace_space": "Aerospace & Space",
     "basic_science":   "Basic Science",
@@ -50,10 +56,15 @@ DOMAIN_LABELS = {
 }
 DOMAIN_COLORS = sns.color_palette("tab10", len(DOMAINS))
 
-out_dir = Path(OUT_DIR)
-out_dir.mkdir(parents=True, exist_ok=True)
+Path(PLOTS_DIR).mkdir(parents=True, exist_ok=True)
 
 sns.set_theme(style="whitegrid", font_scale=1.05)
+plt.rcParams.update({
+    "axes.edgecolor":    "black",
+    "axes.linewidth":    1.2,
+    "axes.spines.top":   True,
+    "axes.spines.right": True,
+})
 
 # National aggregates by year (51 states summed)
 nat = (
@@ -90,7 +101,7 @@ ax.set_ylabel("Funding ($B)")
 ax.legend(loc="upper left")
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.0fB"))
 fig.tight_layout()
-fig.savefig(out_dir / "tot_funding_by_source.pdf")
+fig.savefig(Path(PLOTS_DIR) / "tot_funding_by_source.pdf")
 plt.show()
 
 # ---------------------------------------------------------------------------
@@ -115,7 +126,7 @@ ax2.set_title("National R&D Grants per Capita ($)")
 ax2.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.0f"))
 
 fig.tight_layout()
-fig.savefig(out_dir / "funding_intensity_per_capita.pdf")
+fig.savefig(Path(PLOTS_DIR) / "funding_intensity_per_capita.pdf")
 plt.show()
 
 # ---------------------------------------------------------------------------
@@ -160,7 +171,7 @@ ax3.set_title(f"Top 20 States – R&D % of GSP ({latest_year})")
 ax3.xaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f%%"))
 
 fig.tight_layout()
-fig.savefig(out_dir / "top20_states_24.pdf")
+fig.savefig(Path(PLOTS_DIR) / "top20_states_24.pdf")
 plt.show()
 
 # ---------------------------------------------------------------------------
@@ -188,7 +199,7 @@ ax.set_title("NSF Grants by HJT Innovation Domain")
 ax.legend(loc="upper left", fontsize=8, ncol=2)
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.1fB"))
 fig.tight_layout()
-#fig.savefig(out_dir / "05_nsf_by_domain.pdf")
+fig.savefig(Path(PLOTS_DIR) / "nsf_by_domain.pdf")
 plt.show()
 
 # ---------------------------------------------------------------------------
@@ -216,54 +227,75 @@ ax.set_title("NIH Grants by HJT Innovation Domain")
 ax.legend(loc="upper left", fontsize=8, ncol=2)
 ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.0fB"))
 fig.tight_layout()
-#fig.savefig(out_dir / "06_nih_by_domain.pdf")
+fig.savefig(Path(PLOTS_DIR) / "nih_by_domain.pdf")
 plt.show()
 
 # ---------------------------------------------------------------------------
-# Plot 7 – Distribution of rd_funding_pct_gsp by decade
+# Plot 7 – DOE + DARPA (USASpending) total by year
+# Note: no domain-level breakdown available in usaspending_rd_grants_usd
 # ---------------------------------------------------------------------------
-df_gsp = df.dropna(subset=["rd_funding_pct_gsp"]).copy()
-df_gsp["decade"] = (df_gsp["year"] // 10 * 10).astype(str) + "s"
+usa_nat = (
+    df.groupby("year")["usaspending_rd_grants_usd"]
+    .sum()
+    .reset_index()
+    .rename(columns={"usaspending_rd_grants_usd": "usa"})
+)
 
-fig, ax = plt.subplots(figsize=(9, 5))
-sns.boxplot(
-    data=df_gsp, x="decade", y="rd_funding_pct_gsp",
-    palette="Blues", ax=ax, fliersize=2,
-)
-ax.set_xlabel("Decade")
-ax.set_ylabel("R&D / GSP (%)")
-ax.set_title("State R&D Intensity Distribution by Decade")
-ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.2f%%"))
-fig.tight_layout()
-#fig.savefig(out_dir / "07_intensity_by_decade.pdf")
-plt.show()
-
-# ---------------------------------------------------------------------------
-# Plot 8 – Heatmap: top 15 states x year (rd_funding_per_capita)
-# ---------------------------------------------------------------------------
-top15_states = (
-    df.groupby("state")["total_rd_funding_usd"].sum()
-    .nlargest(15).index.tolist()
-)
-heat = (
-    df[df["state"].isin(top15_states)]
-    .pivot_table(index="state", columns="year", values="rd_funding_per_capita")
-)
-# Keep every 3 years to avoid crowding
-keep_years = [y for y in heat.columns if y % 3 == 0]
-heat = heat[keep_years]
-
-fig, ax = plt.subplots(figsize=(14, 6))
-sns.heatmap(
-    heat, ax=ax, cmap="YlOrRd", linewidths=0.3,
-    fmt=".0f", annot=False,
-    cbar_kws={"label": "R&D per capita ($)"},
-)
-ax.set_title("R&D per Capita by State and Year (Top 15 States)")
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.plot(usa_nat["year"], usa_nat["usa"] / 1e9, color="#C44E52", linewidth=2)
+ax.fill_between(usa_nat["year"], usa_nat["usa"] / 1e9, alpha=0.15, color="#C44E52")
 ax.set_xlabel("Year")
-ax.set_ylabel("")
+ax.set_ylabel("Funding ($B)")
+ax.set_title("DOE + DARPA R&D Grants (USASpending)")
+ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("$%.0fB"))
 fig.tight_layout()
-#fig.savefig(out_dir / "08_heatmap_per_capita.pdf")
+#fig.savefig(Path(PLOTS_DIR) / "07_doe_darpa_total.pdf")
+plt.show()
+
+# ---------------------------------------------------------------------------
+# Plot 8 – Heatmap: top 25 states x domain (% share of state total)
+# Averaged over all available years; rows sorted by total funding.
+# ---------------------------------------------------------------------------
+PLOT_DOMAINS = [d for d in DOMAINS if d != "other"]  # exclude other for clarity
+
+# Sum each domain across NSF + NIH + USA sources per state-year
+df_heat = df.copy()
+for d in PLOT_DOMAINS:
+    cols = [f"{src}_{d}_usd" for src in ("nsf", "nih", "usa") if f"{src}_{d}_usd" in df.columns]
+    df_heat[f"total_{d}_usd"] = df_heat[cols].sum(axis=1) if cols else 0.0
+
+# Average over years, keep top 25 states by total funding
+top25_states = (
+    df_heat.groupby("state")["total_rd_funding_usd"].sum()
+    .nlargest(25).index.tolist()
+)
+state_domain = (
+    df_heat[df_heat["state"].isin(top25_states)]
+    .groupby("state")[[f"total_{d}_usd" for d in PLOT_DOMAINS]]
+    .mean()
+)
+# Normalize to row share (%) so heatmap shows domain mix, not size
+state_domain_pct = state_domain.div(state_domain.sum(axis=1), axis=0) * 100
+state_domain_pct.columns = [DOMAIN_LABELS[d] for d in PLOT_DOMAINS]
+# Sort rows by total funding descending
+state_domain_pct = state_domain_pct.loc[
+    df_heat[df_heat["state"].isin(top25_states)]
+    .groupby("state")["total_rd_funding_usd"].sum()
+    .sort_values(ascending=False).index
+]
+
+fig, ax = plt.subplots(figsize=(14, 9))
+sns.heatmap(
+    state_domain_pct, ax=ax, cmap="YlOrRd", linewidths=0.4,
+    annot=True, fmt=".1f",
+    cbar_kws={"label": "% of state R&D funding"},
+)
+ax.set_title("Domain Specialization by State – Share of Total R&D Funding (%, avg. all years)")
+ax.set_xlabel("")
+ax.set_ylabel("")
+ax.tick_params(axis="x", rotation=40)
+fig.tight_layout()
+#fig.savefig(Path(PLOTS_DIR) / "08_heatmap_state_domain.pdf")
 plt.show()
 
 # ---------------------------------------------------------------------------
@@ -322,7 +354,7 @@ for ax, (col, nat_col, ylabel) in zip(axes, PANELS):
 axes[1].set_xlabel("Year")
 fig.suptitle("State R&D Funding Density: All States vs. Top 5", fontsize=13)
 plt.tight_layout(rect=[0, 0, 1, 0.97])
-#fig.savefig(out_dir / "09_funding_density_ts.pdf")
+fig.savefig(Path(PLOTS_DIR) / "funding_density_state_ts.pdf")
 plt.show()
 
 
