@@ -102,6 +102,7 @@ rm(list = ls())
 
 # Import libraries
 library(data.table)
+library(RPostgres)
 
 # Source helper scripts
 source('utils/setPaths.R')

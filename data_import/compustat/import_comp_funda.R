@@ -92,6 +92,7 @@ rm(list = ls())
 
 # Import libraries
 library(data.table)
+library(RPostgres)
 
 # Source helper scripts
 source('utils/setPaths.R')
@@ -124,10 +125,10 @@ varlist <- c('cusip', 'conm', 'tic', 'fdate',
              'ib', 'icapt', 'itcb',
              'ivao', 'lt', 'mib',
              'naicsh',
-             'ni', 'pdate',
+             'ni', 'oibdp', 'pdate',
              'ppegt', 'prstkc', 'prstkcc', 'pstk', 'pstkl', 'pstkrv',
              're', 'revt', 'sale', 'seq', 'sich',
-             'scstkc', 'sstk',
+             'scstkc', 'sstk', 
              'txdb', 'txdi', 'txditc', 'wcapch', 'xint', 'xlr',
              'xrd', 'xsga', 'prcc_f')
 
@@ -175,7 +176,7 @@ if(any(duplicated(adata[, .(gvkey, datadate)]))){
 }
 
 # save data
-saveRDS(adata, paste0(RAWDIR, 'compustat/compustat_funda.rds'))
+saveRDS(adata, paste0(RAWDIR, 'Compustat/compustat_funda.rds'))
 print('Compustat annual data has been downloaded to database successfully.')
 
 

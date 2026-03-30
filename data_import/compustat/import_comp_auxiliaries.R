@@ -20,7 +20,7 @@
 # Date:
 # ----------
 #   2022-05-12
-#   update: 2026-01-23
+#   update: 2026-03-30
 #
 # Author(s):
 # ----------
@@ -41,6 +41,7 @@ rm(list = ls())
 
 # Import libraries
 library(data.table)
+library(RPostgres)
 
 # Source helper scripts
 source('utils/setPaths.R')
@@ -68,8 +69,25 @@ comp_histnames <- dbGetQuery(wrds,"SELECT * from crsp.comphist")
 # Download Compustat names table: get sic/naics code (most recent one) ####
 comp_names <- dbGetQuery(wrds,"SELECT * from comp.names")
 
-# Download Compustat legal names ####
-company <- dbGetQuery(wrds,"SELECT gvkey, conml from comp.company")
+# Download Compustat company legal names and locations ####
+vars <- dbGetQuery(wrds, "
+  SELECT column_name
+  FROM information_schema.columns
+  WHERE table_schema = 'comp'
+    AND table_name = 'company'
+  ORDER BY column_name
+")
+
+company_vars <- c(
+  "gvkey", "conm", "conml",
+  "state", "city", "county",
+  "loc", "fic",
+  "sic", "naics",
+  "gsector", "ggroup", "gind", "gsubind",
+  "cik", "ipodate"
+)
+
+company <- dbGetQuery(wrds, sprintf("SELECT %s FROM comp.company", paste(company_vars, collapse = ",")))
 
 
 # ================================================================= #
@@ -123,9 +141,9 @@ setkeyv(company, c('gvkey'))
 # Write data ####
 #================================================================== #
 # save files
-saveRDS(comp_names, paste0(RAWDIR, 'compustat/compustat_names.rds'))
-saveRDS(comp_histnames, paste0(RAWDIR, 'compustat/compustat_histnames.rds'))
-saveRDS(company, paste0(RAWDIR, 'compustat/compustat_conml.rds'))
+saveRDS(comp_names, paste0(RAWDIR, 'Compustat/compustat_names.rds'))
+saveRDS(comp_histnames, paste0(RAWDIR, 'Compustat/compustat_histnames.rds'))
+saveRDS(company, paste0(RAWDIR, 'Compustat/compustat_conml.rds'))
 print('Compustat names data has been downloaded to database successfully.')
 
 

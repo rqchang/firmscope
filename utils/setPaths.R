@@ -10,22 +10,22 @@ if(Sys.info()['sysname']=="Linux"){
 }else{
   switch(Sys.info()["user"],
          "chang.2590" = {
-           DATADIR <- "D:/Dropbox/project/fund_contagion/data"
-           RAWDIR <- "D:/Dropbox/project/fund_contagion/data/raw/"
-           TEMPDIR <- "D:/Dropbox/project/fund_contagion/data/temp/"
-           PROCDIR <- "D:/Dropbox/project/fund_contagion/data/processed/"
-           OUTDIR <- "D:/Dropbox/project/fund_contagion/outputs/"
-           PLOTSDIR <- "D:/Dropbox/project/fund_contagion/outputs/plots/"
-           TABLESDIR <- "D:/Dropbox/project/fund_contagion/outputs/tables/"
+           DATADIR <- "D:/Dropbox/project/firm_scope/data"
+           RAWDIR <- "D:/Dropbox/project/firm_scope/data/raw/"
+           TEMPDIR <- "D:/Dropbox/project/firm_scope/data/temp/"
+           PROCDIR <- "D:/Dropbox/project/firm_scope/data/processed/"
+           OUTDIR <- "D:/Dropbox/project/firm_scope/outputs/"
+           PLOTSDIR <- "D:/Dropbox/project/firm_scope/outputs/plots/"
+           TABLESDIR <- "D:/Dropbox/project/firm_scope/outputs/tables/"
          },
          "ziqili" = {
-           DATADIR <- "/Users/ziqili/Dropbox (Personal)/projects/fund_contagion/data"
-           RAWDIR <- "/Users/ziqili/Dropbox (Personal)/projects/fund_contagion/data/raw/"
-           TEMPDIR <- "/Users/ziqili/Dropbox (Personal)/projects/fund_contagion/data/temp/"
-           PROCDIR <- "/Users/ziqili/Dropbox (Personal)/projects/fund_contagion/data/processed/"
-           OUTDIR <- "/Users/ziqili/Dropbox (Personal)/projects/fund_contagion/outputs/"
-           PLOTSDIR <- "/Users/ziqili/Dropbox (Personal)/projects/fund_contagion/outputs/plots/"
-           TABLESDIR <- "/Users/ziqili/Dropbox (Personal)/projects/fund_contagion/outputs/tables/"
+           DATADIR <- "/Users/ziqili/Dropbox (Personal)/projects/firm_scope/data"
+           RAWDIR <- "/Users/ziqili/Dropbox (Personal)/projects/firm_scope/data/raw/"
+           TEMPDIR <- "/Users/ziqili/Dropbox (Personal)/projects/firm_scope/data/temp/"
+           PROCDIR <- "/Users/ziqili/Dropbox (Personal)/projects/firm_scope/data/processed/"
+           OUTDIR <- "/Users/ziqili/Dropbox (Personal)/projects/firm_scope/outputs/"
+           PLOTSDIR <- "/Users/ziqili/Dropbox (Personal)/projects/firm_scope/outputs/plots/"
+           TABLESDIR <- "/Users/ziqili/Dropbox (Personal)/projects/firm_scope/outputs/tables/"
          }
          )
 }
