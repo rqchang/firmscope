@@ -8,8 +8,10 @@ external innovation pressure on firm scope.
 Pipeline position
 -----------------
   import_funding.py  -->  [RAW_DIR/funding/]  -->  aggregate_funding.py
-                                                     -->  funding_panel.csv
-                                                     -->  bartik_shares.csv
+                                                     -->  funding_panel.csv          (main)
+                                                     -->  funding_panel_robust.csv   (robustness)
+                                                     -->  bartik_shares.csv          (main)
+                                                     -->  bartik_shares_robust.csv   (robustness)
 
 Design rationale
 ----------------
@@ -57,15 +59,19 @@ Responsibilities
        share of agency a's grants over a pre-sample base period. The instrument
        Z_{s,t} = sum_a theta_{s,a} * B_{a,t} (constructed separately using
        national agency budgets B_{a,t}) isolates plausibly exogenous variation
-       in local funding from congressional appropriation shocks. Agencies:
-       NSF and NIH (treated separately for over-identification tests).
+       in local funding from congressional appropriation shocks. Main spec:
+       NSF and NIH only (treated separately for over-identification tests).
+       Robust spec adds DOE and DARPA, but shares are estimated within-sample
+       (post-2008), weakening the pre-determination argument; use for
+       heterogeneity checks only.
 
 Output files (PROC_DIR/eip/)
 -----------------------------
   logs/
     aggregate_funding_{ts}.log   run log with load counts, panel shape, and errors
 
-  funding_panel.csv
+  funding_panel.csv          (--no_usaspending; main specification)
+  funding_panel_robust.csv   (USASpending included; post-2008 robustness)
     state                     str    2-letter state abbreviation
     year                      int    calendar year (after FY alignment)
     nsf_grants_usd            float  total NSF ($)
@@ -77,9 +83,10 @@ Output files (PROC_DIR/eip/)
     rd_funding_pct_gsp        float  total / (gsp_millions * 1e6)
     rd_funding_per_capita     float  total / population
 
-  bartik_shares.csv
+  bartik_shares.csv          (--no_usaspending; main specification)
+  bartik_shares_robust.csv   (USASpending included; post-2008 robustness)
     state   str    2-letter state abbreviation
-    agency  str    nsf | nih
+    agency  str    nsf | nih | doe | darpa
     share   float  state's avg share of agency grants in base period [0, 1]
     Note: shares sum to 1.0 within each agency across states.
 
@@ -412,9 +419,11 @@ def main():
                 "excluded" if args.no_usaspending else len(usa),
                 len(gsp), len(pop))
 
+    suffix = "" if args.no_usaspending else "_robust"
+
     print("\n[Step 2] Building funding panel...")
     panel = build_panel(nsf, nih, usa, gsp, pop)
-    out_panel = PROC_EIP / "funding_panel.csv"
+    out_panel = PROC_EIP / f"funding_panel{suffix}.csv"
     panel.to_csv(out_panel, index=False)
     logger.info("Panel saved: %s  (%d rows, %d cols)", out_panel, *panel.shape)
     print(f"  [3/3] Saved: {out_panel}")
@@ -431,7 +440,7 @@ def main():
     shares = build_bartik_shares(
         nsf, nih, usa, args.bartik_base_start, args.bartik_base_end
     )
-    out_shares = PROC_EIP / "bartik_shares.csv"
+    out_shares = PROC_EIP / f"bartik_shares{suffix}.csv"
     shares.to_csv(out_shares, index=False)
     logger.info("Bartik shares saved: %s  (%d rows)", out_shares, len(shares))
     logger.info("Done.")
