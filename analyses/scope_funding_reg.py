@@ -127,15 +127,22 @@ state_yr["bartik_z"] = (
     state_yr["share_nih"] * state_yr["loo_nih"]
 )
 
-# Scale-matched instruments
-state_yr["bartik_z_pc"]      = state_yr["bartik_z"] / state_yr["population"].clip(lower=1)
-state_yr["bartik_z_pct_gsp"] = state_yr["bartik_z"] / (state_yr["gsp_millions"].clip(lower=1e-3) * 1e6)
+# Scale-matched composite instruments
+_pop = state_yr["population"].clip(lower=1)
+_gsp = state_yr["gsp_millions"].clip(lower=1e-3) * 1e6
+state_yr["bartik_z_pc"]      = state_yr["bartik_z"] / _pop
+state_yr["bartik_z_pct_gsp"] = state_yr["bartik_z"] / _gsp
+
+# Agency-level per-capita instruments (for over-identified IV and Rotemberg weights)
+state_yr["bartik_z_nsf_pc"]  = state_yr["share_nsf"] * state_yr["loo_nsf"] / _pop
+state_yr["bartik_z_nih_pc"]  = state_yr["share_nih"] * state_yr["loo_nih"] / _pop
 
 
 " Merge to firm-year panel "
 df = pd.merge(scope, comp, on=["gvkey", "year"], how="inner")
 df = pd.merge(df, state_yr[["state", "year", "rd_funding_per_capita", "rd_funding_pct_gsp",
                             "bartik_z", "bartik_z_pc", "bartik_z_pct_gsp",
+                            "bartik_z_nsf_pc", "bartik_z_nih_pc",
                             "gsp_millions", "population"]].drop_duplicates(["state", "year"]),
                         on=["state", "year"], how="inner")
 df = pd.merge(df, seg, on=["gvkey", "year"], how="left")
@@ -152,6 +159,8 @@ df["ln_rd_pc"]          = np.log(df["rd_funding_per_capita"])
 df["ln_rd_pct_gsp"]     = np.log(df["rd_funding_pct_gsp"])
 df["ln_z_pc"]           = np.log(df["bartik_z_pc"].clip(lower=1e-6))
 df["ln_z_pct_gsp"]      = np.log(df["bartik_z_pct_gsp"].clip(lower=1e-12))
+df["ln_z_nsf"]          = np.log(df["bartik_z_nsf_pc"].clip(lower=1e-12))
+df["ln_z_nih"]          = np.log(df["bartik_z_nih_pc"].clip(lower=1e-12))
 df["ln_sale"]       = np.log(df["sale"])
 df["rd_intensity"]  = (df["xrd"].fillna(0) / df["sale"]).clip(0, 1)
 df["roa"]           = (df["oibdp"] / df["at"]).clip(-1, 1)
@@ -160,18 +169,30 @@ df["cash_ratio"]    = (df["che"]   / df["at"]).clip(0, 1)
 df["naics2"]        = df["naicsh_filled"].astype(str).str[:2]
 df["ln_gsp_pc"]     = np.log(df["gsp_millions"] * 1e6 / df["population"].clip(lower=1))
 
-# Lag treatment, instrument, and all controls by one year within firm
+# State GDP growth (robustness control)
+df = df.sort_values(["state", "year"])
+df["gsp_growth"] = df.groupby("state")["gsp_millions"].pct_change()
+
+# Lag treatment, instruments, and all controls by one year within firm
 df = df.sort_values(["gvkey", "year"])
 _to_lag = ["ln_rd_pc", "ln_rd_pct_gsp", "ln_z_pc", "ln_z_pct_gsp",
-           "ln_sale", "rd_intensity", "roa", "leverage", "cash_ratio", "ln_gsp_pc"]
+           "ln_z_nsf", "ln_z_nih",
+           "ln_sale", "rd_intensity", "roa", "leverage", "cash_ratio",
+           "ln_gsp_pc", "gsp_growth"]
 for col in _to_lag:
     df[f"{col}_lag"] = df.groupby("gvkey")[col].shift(1)
 
-df = df.dropna(subset=["d2vscope", "ln_rd_pc_lag", "ln_rd_pct_gsp_lag",
+# Binary dependent variable: 1[scope expanded this year]
+df["d2vscope_prev"] = df.groupby("gvkey")["d2vscope"].shift(1)
+df["expand_scope"]  = (df["d2vscope"] - df["d2vscope_prev"] > 0).astype(float)
+
+df = df.dropna(subset=["d2vscope", "expand_scope",
+                        "ln_rd_pc_lag", "ln_rd_pct_gsp_lag",
                         "ln_z_pc_lag", "ln_z_pct_gsp_lag",
+                        "ln_z_nsf_lag", "ln_z_nih_lag",
                         "ln_sale_lag", "rd_intensity_lag", "roa_lag",
                         "leverage_lag", "cash_ratio_lag", "ln_gsp_pc_lag",
-                        "naics2"]).copy()
+                        "gsp_growth_lag", "naics2"]).copy()
 df = df.reset_index(drop=True)
 
 print(
@@ -183,8 +204,9 @@ print(
 
 
 """ Run regressions """
-CTRL_COLS = ["ln_sale_lag", "rd_intensity_lag", "roa_lag",
-             "leverage_lag", "cash_ratio_lag", "ln_gsp_pc_lag"]
+CTRL_COLS        = ["ln_sale_lag", "rd_intensity_lag", "roa_lag",
+                    "leverage_lag", "cash_ratio_lag", "ln_gsp_pc_lag"]
+CTRL_COLS_ROBUST = CTRL_COLS + ["gsp_growth_lag"]  # + lagged state GDP growth
 
 # Panel structure for PanelOLS (entity=gvkey, time=year)
 df_p       = df.set_index(["gvkey", "year"])
@@ -217,12 +239,15 @@ def run_panel_ols(df_panel, depvar, exog_cols, other_effects=None):
     ).fit(cov_type="clustered", clusters=clusters_p)
 
 
-def run_absorbing_iv(df_reg, depvar, endog_col, instrument_col, exog_cols, absorb_df):
+def run_absorbing_iv(df_reg, depvar, endog_col, instrument_cols, exog_cols, absorb_df):
     """
     2SLS with absorbed FEs, clustered by state.
     Partials out FEs via AbsorbingLS (OLS) then runs IV2SLS on residuals (FWL).
-    Equivalent to full 2SLS with FE dummies; compatible with linearmodels < 0.60.
+    instrument_cols: str (just-identified) or list of str (over-identified).
     """
+    if isinstance(instrument_cols, str):
+        instrument_cols = [instrument_cols]
+
     def _resid(col):
         ones = pd.Series(np.ones(len(df_reg)), index=df_reg.index, name="_c")
         r = AbsorbingLS(df_reg[col], ones, absorb=absorb_df).fit()
@@ -230,10 +255,10 @@ def run_absorbing_iv(df_reg, depvar, endog_col, instrument_col, exog_cols, absor
 
     y_r = _resid(depvar)
     x_r = _resid(endog_col)
-    z_r = _resid(instrument_col)
+    Z_r = pd.concat([_resid(z) for z in instrument_cols], axis=1)
     C_r = pd.concat([_resid(c) for c in exog_cols], axis=1)
 
-    return IV2SLS(y_r, C_r, x_r.to_frame(), z_r.to_frame()
+    return IV2SLS(y_r, C_r, x_r.to_frame(), Z_r
                   ).fit(cov_type="clustered", clusters=clusters_abs)
 
 
@@ -406,6 +431,123 @@ for res, title in [
 ]:
     print_result(res, title)
 print(f"  First-stage F — Spec 1: {fs_F1b:.1f}   Spec 2: {fs_F2b:.1f}")
+
+
+""" Panel C: Over-identified IV — separate NSF and NIH instruments
+    Exploits differential timing: NIH doubled 2000-2003; NSF was flat.
+    States with different NSF vs NIH shares have differential within-state
+    variation after two-way FEs — restores first-stage power.
+    Hansen J-test checks instrument consistency.
+"""
+print("\n=== Panel C: Over-ID IV — Z_NSF + Z_NIH as separate instruments ===")
+
+IV2_COLS = ["ln_z_nsf_lag", "ln_z_nih_lag"]
+
+# First-stage strength of each agency separately
+r_fs_nsf = run_panel_ols(df_p, "ln_rd_pc_lag", ["ln_z_nsf_lag"] + CTRL_COLS)
+r_fs_nih = run_panel_ols(df_p, "ln_rd_pc_lag", ["ln_z_nih_lag"] + CTRL_COLS)
+r_fs_ovid = run_panel_ols(df_p, "ln_rd_pc_lag", IV2_COLS + CTRL_COLS)
+fs_F_nsf = float(r_fs_nsf.tstats["ln_z_nsf_lag"]) ** 2
+fs_F_nih = float(r_fs_nih.tstats["ln_z_nih_lag"]) ** 2
+print_result(r_fs_ovid, "First Stage (both) — ln(R&D/pop)_{t-1} ~ Z_NSF + Z_NIH  [Firm+Year FE]")
+print(f"\n  F(NSF only): {fs_F_nsf:.1f}   F(NIH only): {fs_F_nih:.1f}")
+
+r_iv_ovid1 = run_absorbing_iv(df, "d2vscope", "ln_rd_pc_lag", IV2_COLS, CTRL_COLS, absorb_yr)
+r_iv_ovid2 = run_absorbing_iv(df, "d2vscope", "ln_rd_pc_lag", IV2_COLS, CTRL_COLS, absorb_indyr)
+print_result(r_iv_ovid1, "2SLS (over-ID) — d2vscope ~ ln(R&D/pop)  [Firm+Year FE]")
+print_result(r_iv_ovid2, "2SLS (over-ID) — d2vscope ~ ln(R&D/pop)  [Firm+Ind×Year FE]")
+try:
+    print(f"  Hansen J p-val (Spec 1): {r_iv_ovid1.j_statistic.pval:.3f}  "
+          f"(Spec 2): {r_iv_ovid2.j_statistic.pval:.3f}  (p>0.1 → consistent)")
+except Exception:
+    pass
+
+
+""" Rotemberg weights: decompose composite IV by agency
+    α̂_a = (z̃_a · z̃) / (z̃ · z̃)  where z̃ are FWL residuals after partialing FEs+controls
+    β̂_a = just-identified IV using only agency a's instrument
+    Check: Σ α̂_a · β̂_a ≈ β̂_2SLS
+"""
+print("\n=== Rotemberg Weights (Goldsmith-Pinkham et al. 2020) ===")
+
+def _fwl(col):
+    ones = pd.Series(np.ones(len(df)), index=df.index, name="_c")
+    r = AbsorbingLS(df[col], ones, absorb=absorb_yr).fit()
+    return pd.Series(r.resids.values.ravel(), index=df.index)
+
+z_r     = _fwl("ln_z_pc_lag")
+z_nsf_r = _fwl("ln_z_nsf_lag")
+z_nih_r = _fwl("ln_z_nih_lag")
+z_sq    = (z_r ** 2).sum()
+alpha_nsf = (z_nsf_r * z_r).sum() / z_sq
+alpha_nih = (z_nih_r * z_r).sum() / z_sq
+
+beta_nsf  = float(r_fs_nsf.params["ln_z_nsf_lag"])   # FS coef, not IV
+# Just-identified IV β̂_a
+def _just_iv(z_col):
+    y_r = _fwl("d2vscope"); x_r = _fwl("ln_rd_pc_lag"); zz_r = _fwl(z_col)
+    C_r = pd.concat([_fwl(c) for c in CTRL_COLS], axis=1)
+    return float(IV2SLS(y_r, C_r, x_r.to_frame(), zz_r.to_frame()
+                        ).fit(cov_type="clustered", clusters=clusters_abs
+                              ).params["ln_rd_pc_lag"])
+
+beta_iv_nsf = _just_iv("ln_z_nsf_lag")
+beta_iv_nih = _just_iv("ln_z_nih_lag")
+beta_2sls   = float(r_iv1.params["ln_rd_pc_lag"])
+
+print(f"  {'Agency':5s}  {'α̂':>8}  {'β̂ (just-ID)':>14}  {'α̂·β̂':>10}")
+print(f"  {'-----':5s}  {'--------':>8}  {'----------':>14}  {'----------':>10}")
+print(f"  {'NSF':5s}  {alpha_nsf:8.4f}  {beta_iv_nsf:14.4f}  {alpha_nsf*beta_iv_nsf:10.4f}")
+print(f"  {'NIH':5s}  {alpha_nih:8.4f}  {beta_iv_nih:14.4f}  {alpha_nih*beta_iv_nih:10.4f}")
+print(f"  {'Sum':5s}  {alpha_nsf+alpha_nih:8.4f}  {'':14}  {alpha_nsf*beta_iv_nsf+alpha_nih*beta_iv_nih:10.4f}")
+print(f"  {'2SLS':5s}  {'':8}  {beta_2sls:14.4f}  (check: Σα̂β̂ ≈ 2SLS)")
+
+
+""" Panel D: Robustness — state linear trends + extended controls """
+print("\n=== Panel D: Robustness — state linear trends + extended controls ===")
+
+def partial_state_trends(df_in, cols):
+    """Remove state-specific linear time trend from each column."""
+    df_out = df_in.copy()
+    year_f = df_in["year"].astype(float).values
+    for col in cols:
+        y   = df_in[col].values.astype(float)
+        out = y.copy()
+        for st in df_in["state"].unique():
+            mask = (df_in["state"] == st).values
+            x, yy = year_f[mask], y[mask]
+            valid = np.isfinite(x) & np.isfinite(yy)
+            if valid.sum() >= 3:
+                coef = np.polyfit(x[valid], yy[valid], 1)
+                out[mask] = yy - np.polyval(coef, x)
+        df_out[col] = out
+    return df_out
+
+trend_cols = ["d2vscope", "ln_rd_pc_lag", "ln_z_pc_lag"] + CTRL_COLS_ROBUST
+df_dt      = partial_state_trends(df, trend_cols)
+df_dt_p    = df_dt.set_index(["gvkey", "year"])
+cl_dt      = df_dt_p["state"]
+
+r_ols_dt = PanelOLS(
+    df_dt_p["d2vscope"], df_dt_p[["ln_rd_pc_lag"] + CTRL_COLS_ROBUST],
+    entity_effects=True, time_effects=True,
+).fit(cov_type="clustered", clusters=cl_dt)
+
+r_fs_dt = PanelOLS(
+    df_dt_p["ln_rd_pc_lag"], df_dt_p[["ln_z_pc_lag"] + CTRL_COLS_ROBUST],
+    entity_effects=True, time_effects=True,
+).fit(cov_type="clustered", clusters=cl_dt)
+fs_F_dt = float(r_fs_dt.tstats["ln_z_pc_lag"]) ** 2
+
+absorb_yr_dt = pd.DataFrame({"firm": pd.Categorical(df_dt["gvkey"]),
+                              "year": pd.Categorical(df_dt["year"].astype(str))})
+r_iv_dt = run_absorbing_iv(df_dt, "d2vscope", "ln_rd_pc_lag", "ln_z_pc_lag",
+                           CTRL_COLS_ROBUST, absorb_yr_dt)
+
+print_result(r_ols_dt, "OLS  [state-detrended + GSP growth, Firm+Year FE]")
+print_result(r_fs_dt,  f"First Stage  [state-detrended]  F={fs_F_dt:.1f}")
+print_result(r_iv_dt,  "2SLS  [state-detrended + GSP growth, Firm+Year FE]")
+
 
 " Save coefficient tables "
 coef_tables = pd.concat([
