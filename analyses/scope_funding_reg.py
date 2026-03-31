@@ -148,7 +148,7 @@ df = pd.merge(df, state_yr[["state", "year", "rd_funding_per_capita", "rd_fundin
 df = pd.merge(df, seg, on=["gvkey", "year"], how="left")
 
 " Sample restrictions & variable construction "
-df = df[df["year"].between(1997, 2021)].copy()   # scope: 1988-2021; funding: 1997-2024
+df = df[df["year"].between(2000, 2021)].copy()   # scope: 1988-2021; base period ends 1996; sample 2000-2021
 df = df[df["rd_funding_per_capita"] > 0].copy()
 df = df[df["rd_funding_pct_gsp"]    > 0].copy()
 df = df[df["bartik_z"] > 0].copy()
@@ -182,11 +182,11 @@ _to_lag = ["ln_rd_pc", "ln_rd_pct_gsp", "ln_z_pc", "ln_z_pct_gsp",
 for col in _to_lag:
     df[f"{col}_lag"] = df.groupby("gvkey")[col].shift(1)
 
-# Binary dependent variable: 1[scope expanded this year]
-df["d2vscope_prev"] = df.groupby("gvkey")["d2vscope"].shift(1)
-df["expand_scope"]  = (df["d2vscope"] - df["d2vscope_prev"] > 0).astype(float)
+# Binary dependent variable: 1[Δd2vscope > 0] (LPM)
+df["d2vscope_prev"]  = df.groupby("gvkey")["d2vscope"].shift(1)
+df["scope_increase"] = (df["d2vscope"] - df["d2vscope_prev"] > 0).astype(float)
 
-df = df.dropna(subset=["d2vscope", "expand_scope",
+df = df.dropna(subset=["scope_increase",
                         "ln_rd_pc_lag", "ln_rd_pct_gsp_lag",
                         "ln_z_pc_lag", "ln_z_pct_gsp_lag",
                         "ln_z_nsf_lag", "ln_z_nih_lag",
@@ -301,24 +301,25 @@ def to_coef_df(res, label):
     })
 
 
-def run_all_specs(treat_lag, instr_lag="ln_z_lag", ctrl_cols=None):
+def run_all_specs(treat_lag, instr_lag="ln_z_lag", ctrl_cols=None, depvar="scope_increase"):
     """Run OLS(1,2), FS(1,2), IV(1,2), RF(1,2) for a given lagged treatment variable.
 
     ctrl_cols: override default CTRL_COLS (e.g. drop ln_gsp_pc_lag when treatment
                already embeds GSP in its denominator, to avoid exact collinearity).
+    depvar: outcome variable for OLS/IV/RF (default: scope_increase).
     """
     cc = ctrl_cols if ctrl_cols is not None else CTRL_COLS
-    r_ols1 = run_panel_ols(df_p, "d2vscope", [treat_lag] + cc)
-    r_ols2 = run_panel_ols(df_p, "d2vscope", [treat_lag] + cc, other_effects=indyr_fe)
+    r_ols1 = run_panel_ols(df_p, depvar, [treat_lag] + cc)
+    r_ols2 = run_panel_ols(df_p, depvar, [treat_lag] + cc, other_effects=indyr_fe)
     r_fs1  = run_panel_ols(df_p, treat_lag,  [instr_lag] + cc)
     fs_F1  = float(r_fs1.tstats[instr_lag]) ** 2
     r_fs2  = run_panel_ols(df_p, treat_lag,  [instr_lag] + cc, other_effects=indyr_fe)
     fs_F2  = float(r_fs2.tstats[instr_lag]) ** 2
-    r_iv1  = run_absorbing_iv(df, "d2vscope", treat_lag, instr_lag, cc, absorb_yr)
-    r_iv2  = run_absorbing_iv(df, "d2vscope", treat_lag, instr_lag, cc, absorb_indyr)
+    r_iv1  = run_absorbing_iv(df, depvar, treat_lag, instr_lag, cc, absorb_yr)
+    r_iv2  = run_absorbing_iv(df, depvar, treat_lag, instr_lag, cc, absorb_indyr)
     # Reduced form: regress outcome directly on instrument (no first stage)
-    r_rf1  = run_panel_ols(df_p, "d2vscope", [instr_lag] + cc)
-    r_rf2  = run_panel_ols(df_p, "d2vscope", [instr_lag] + cc, other_effects=indyr_fe)
+    r_rf1  = run_panel_ols(df_p, depvar, [instr_lag] + cc)
+    r_rf2  = run_panel_ols(df_p, depvar, [instr_lag] + cc, other_effects=indyr_fe)
     return r_ols1, r_ols2, r_fs1, r_fs2, r_iv1, r_iv2, r_rf1, r_rf2, fs_F1, fs_F2
 
 
@@ -350,54 +351,9 @@ INSTR_LABELS = {
 }
 
 
-def write_reg_tex(res_tuple, treat_var, instr_var, treat_tex, dv_fs_tex, tex_path):
-    """Write 8-column regression table: OLS(1,2), FS(3,4), 2SLS(5,6), RF(7,8)."""
-    r_ols1, r_ols2, r_fs1, r_fs2, r_iv1, r_iv2, r_rf1, r_rf2, fsF1, fsF2 = res_tuple
-    RES = [r_ols1, r_ols2, r_fs1, r_fs2, r_iv1, r_iv2, r_rf1, r_rf2]
-    instr_tex = INSTR_LABELS.get(instr_var, f"{instr_var}")
-    ROW_VARS = {treat_var: treat_tex, instr_var: instr_tex, **CTRL_LABELS}
-    with open(tex_path, "w") as fh:
-        fh.write(
-            f"% {os.path.basename(tex_path)} -- auto-generated\n"
-            "\\begin{tabular}{lcccccccc}\n"
-            "\\toprule\n"
-            " & \\multicolumn{2}{c}{OLS} & \\multicolumn{2}{c}{First Stage}"
-            " & \\multicolumn{2}{c}{2SLS} & \\multicolumn{2}{c}{Reduced Form} \\\\\n"
-            "\\cmidrule(lr){2-3}\\cmidrule(lr){4-5}\\cmidrule(lr){6-7}\\cmidrule(lr){8-9}\n"
-            " & (1) & (2) & (3) & (4) & (5) & (6) & (7) & (8) \\\\\n"
-            f"\\textit{{Dep. var.}}"
-            f" & d2vscope & d2vscope"
-            f" & {dv_fs_tex} & {dv_fs_tex}"
-            f" & d2vscope & d2vscope"
-            f" & d2vscope & d2vscope \\\\\n"
-            "\\midrule\n"
-        )
-        for var, label in ROW_VARS.items():
-            fh.write(tex_row(label, [fmt_tex(r, var) for r in RES]))
-        fh.write(
-            "\\midrule\n"
-            f"Observations  & {int(r_ols1.nobs):,} & {int(r_ols2.nobs):,}"
-            f" & {int(r_fs1.nobs):,} & {int(r_fs2.nobs):,}"
-            f" & {int(r_iv1.nobs):,} & {int(r_iv2.nobs):,}"
-            f" & {int(r_rf1.nobs):,} & {int(r_rf2.nobs):,} \\\\\n"
-            f"Within-R$^2$  & {r_ols1.rsquared:.3f} & {r_ols2.rsquared:.3f}"
-            f" & {r_fs1.rsquared:.3f} & {r_fs2.rsquared:.3f} & &"
-            f" & {r_rf1.rsquared:.3f} & {r_rf2.rsquared:.3f} \\\\\n"
-            f"First-stage $F$ & & & & & {fsF1:.1f} & {fsF2:.1f} & & \\\\\n"
-            "Firm FE & \\checkmark & \\checkmark & \\checkmark & \\checkmark"
-            " & \\checkmark & \\checkmark & \\checkmark & \\checkmark \\\\\n"
-            "Year FE & \\checkmark & & \\checkmark & & \\checkmark & & \\checkmark & \\\\\n"
-            "Industry $\\times$ Year FE & & \\checkmark & & \\checkmark & & \\checkmark & & \\checkmark \\\\\n"
-            "Clustered SE & State & State & State & State & State & State & State & State \\\\\n"
-            "\\bottomrule\n"
-            "\\end{tabular}\n"
-        )
-    print(f"LaTeX table -> {tex_path}")
-
-
 " Panel A: Treatment = ln(R&D / population), instrument = ln(Z / population) "
 print("\n=== Panel A: Treatment = ln(R&D/pop)_{t-1}, IV = ln(Z/pop)_{t-1} ===")
-res_A = run_all_specs("ln_rd_pc_lag", instr_lag="ln_z_pc_lag")
+res_A = run_all_specs("ln_rd_pc_lag", instr_lag="ln_z_pc_lag", depvar="scope_increase")
 r_ols1, r_ols2, r_fs1, r_fs2, r_iv1, r_iv2, r_rf1, r_rf2, fs_F1, fs_F2 = res_A
 for res, title in [
     (r_ols1, "OLS [Firm+Year FE]"),
@@ -412,12 +368,13 @@ for res, title in [
     print_result(res, title)
 print(f"  First-stage F — Spec 1: {fs_F1:.1f}   Spec 2: {fs_F2:.1f}")
 
+
 " Panel B: Treatment = ln(R&D / GSP), instrument = ln(Z / GSP) "
 # Drop ln_gsp_pc_lag from controls: GSP is already in the treatment denominator,
 # so including ln_gsp_pc_lag would create exact collinearity (ln_rd_pc = ln_rd_pct_gsp + ln_gsp_pc).
 CTRL_COLS_B = [c for c in CTRL_COLS if c != "ln_gsp_pc_lag"]
 print("\n=== Panel B: Treatment = ln(R&D/%%GSP)_{t-1}, IV = ln(Z/GSP)_{t-1} ===")
-res_B = run_all_specs("ln_rd_pct_gsp_lag", instr_lag="ln_z_pct_gsp_lag", ctrl_cols=CTRL_COLS_B)
+res_B = run_all_specs("ln_rd_pct_gsp_lag", instr_lag="ln_z_pct_gsp_lag", ctrl_cols=CTRL_COLS_B, depvar="scope_increase")
 r_ols1b, r_ols2b, r_fs1b, r_fs2b, r_iv1b, r_iv2b, r_rf1b, r_rf2b, fs_F1b, fs_F2b = res_B
 for res, title in [
     (r_ols1b, "OLS [Firm+Year FE]"),
@@ -452,55 +409,15 @@ fs_F_nih = float(r_fs_nih.tstats["ln_z_nih_lag"]) ** 2
 print_result(r_fs_ovid, "First Stage (both) — ln(R&D/pop)_{t-1} ~ Z_NSF + Z_NIH  [Firm+Year FE]")
 print(f"\n  F(NSF only): {fs_F_nsf:.1f}   F(NIH only): {fs_F_nih:.1f}")
 
-r_iv_ovid1 = run_absorbing_iv(df, "d2vscope", "ln_rd_pc_lag", IV2_COLS, CTRL_COLS, absorb_yr)
-r_iv_ovid2 = run_absorbing_iv(df, "d2vscope", "ln_rd_pc_lag", IV2_COLS, CTRL_COLS, absorb_indyr)
-print_result(r_iv_ovid1, "2SLS (over-ID) — d2vscope ~ ln(R&D/pop)  [Firm+Year FE]")
-print_result(r_iv_ovid2, "2SLS (over-ID) — d2vscope ~ ln(R&D/pop)  [Firm+Ind×Year FE]")
+r_iv_ovid1 = run_absorbing_iv(df, "scope_increase", "ln_rd_pc_lag", IV2_COLS, CTRL_COLS, absorb_yr)
+r_iv_ovid2 = run_absorbing_iv(df, "scope_increase", "ln_rd_pc_lag", IV2_COLS, CTRL_COLS, absorb_indyr)
+print_result(r_iv_ovid1, "2SLS (over-ID) — scope_increase ~ ln(R&D/pop)  [Firm+Year FE]")
+print_result(r_iv_ovid2, "2SLS (over-ID) — scope_increase ~ ln(R&D/pop)  [Firm+Ind×Year FE]")
 try:
     print(f"  Hansen J p-val (Spec 1): {r_iv_ovid1.j_statistic.pval:.3f}  "
           f"(Spec 2): {r_iv_ovid2.j_statistic.pval:.3f}  (p>0.1 → consistent)")
 except Exception:
     pass
-
-
-""" Rotemberg weights: decompose composite IV by agency
-    α̂_a = (z̃_a · z̃) / (z̃ · z̃)  where z̃ are FWL residuals after partialing FEs+controls
-    β̂_a = just-identified IV using only agency a's instrument
-    Check: Σ α̂_a · β̂_a ≈ β̂_2SLS
-"""
-print("\n=== Rotemberg Weights (Goldsmith-Pinkham et al. 2020) ===")
-
-def _fwl(col):
-    ones = pd.Series(np.ones(len(df)), index=df.index, name="_c")
-    r = AbsorbingLS(df[col], ones, absorb=absorb_yr).fit()
-    return pd.Series(r.resids.values.ravel(), index=df.index)
-
-z_r     = _fwl("ln_z_pc_lag")
-z_nsf_r = _fwl("ln_z_nsf_lag")
-z_nih_r = _fwl("ln_z_nih_lag")
-z_sq    = (z_r ** 2).sum()
-alpha_nsf = (z_nsf_r * z_r).sum() / z_sq
-alpha_nih = (z_nih_r * z_r).sum() / z_sq
-
-beta_nsf  = float(r_fs_nsf.params["ln_z_nsf_lag"])   # FS coef, not IV
-# Just-identified IV β̂_a
-def _just_iv(z_col):
-    y_r = _fwl("d2vscope"); x_r = _fwl("ln_rd_pc_lag"); zz_r = _fwl(z_col)
-    C_r = pd.concat([_fwl(c) for c in CTRL_COLS], axis=1)
-    return float(IV2SLS(y_r, C_r, x_r.to_frame(), zz_r.to_frame()
-                        ).fit(cov_type="clustered", clusters=clusters_abs
-                              ).params["ln_rd_pc_lag"])
-
-beta_iv_nsf = _just_iv("ln_z_nsf_lag")
-beta_iv_nih = _just_iv("ln_z_nih_lag")
-beta_2sls   = float(r_iv1.params["ln_rd_pc_lag"])
-
-print(f"  {'Agency':5s}  {'α̂':>8}  {'β̂ (just-ID)':>14}  {'α̂·β̂':>10}")
-print(f"  {'-----':5s}  {'--------':>8}  {'----------':>14}  {'----------':>10}")
-print(f"  {'NSF':5s}  {alpha_nsf:8.4f}  {beta_iv_nsf:14.4f}  {alpha_nsf*beta_iv_nsf:10.4f}")
-print(f"  {'NIH':5s}  {alpha_nih:8.4f}  {beta_iv_nih:14.4f}  {alpha_nih*beta_iv_nih:10.4f}")
-print(f"  {'Sum':5s}  {alpha_nsf+alpha_nih:8.4f}  {'':14}  {alpha_nsf*beta_iv_nsf+alpha_nih*beta_iv_nih:10.4f}")
-print(f"  {'2SLS':5s}  {'':8}  {beta_2sls:14.4f}  (check: Σα̂β̂ ≈ 2SLS)")
 
 
 """ Panel D: Robustness — state linear trends + extended controls """
@@ -523,13 +440,13 @@ def partial_state_trends(df_in, cols):
         df_out[col] = out
     return df_out
 
-trend_cols = ["d2vscope", "ln_rd_pc_lag", "ln_z_pc_lag"] + CTRL_COLS_ROBUST
+trend_cols = ["scope_increase", "ln_rd_pc_lag", "ln_z_pc_lag"] + CTRL_COLS_ROBUST
 df_dt      = partial_state_trends(df, trend_cols)
 df_dt_p    = df_dt.set_index(["gvkey", "year"])
 cl_dt      = df_dt_p["state"]
 
 r_ols_dt = PanelOLS(
-    df_dt_p["d2vscope"], df_dt_p[["ln_rd_pc_lag"] + CTRL_COLS_ROBUST],
+    df_dt_p["scope_increase"], df_dt_p[["ln_rd_pc_lag"] + CTRL_COLS_ROBUST],
     entity_effects=True, time_effects=True,
 ).fit(cov_type="clustered", clusters=cl_dt)
 
@@ -541,12 +458,113 @@ fs_F_dt = float(r_fs_dt.tstats["ln_z_pc_lag"]) ** 2
 
 absorb_yr_dt = pd.DataFrame({"firm": pd.Categorical(df_dt["gvkey"]),
                               "year": pd.Categorical(df_dt["year"].astype(str))})
-r_iv_dt = run_absorbing_iv(df_dt, "d2vscope", "ln_rd_pc_lag", "ln_z_pc_lag",
+r_iv_dt = run_absorbing_iv(df_dt, "scope_increase", "ln_rd_pc_lag", "ln_z_pc_lag",
                            CTRL_COLS_ROBUST, absorb_yr_dt)
 
 print_result(r_ols_dt, "OLS  [state-detrended + GSP growth, Firm+Year FE]")
 print_result(r_fs_dt,  f"First Stage  [state-detrended]  F={fs_F_dt:.1f}")
 print_result(r_iv_dt,  "2SLS  [state-detrended + GSP growth, Firm+Year FE]")
+
+
+""" Panel E: Alternative FE structures — loosen FEs to recover Bartik variation
+    The composite Z_{s,t} = theta_s * LOO_t loses nearly all within variation
+    under two-way FE because year FE absorbs the national LOO_t component
+    and corr(theta_NSF, theta_NIH) = 0.917 leaves little differential exposure.
+
+    E-1: Aggregate to state-year; state + year FEs (proper Bartik aggregation level)
+         Drops firm-level noise, uses full state-level R&D variation.
+    E-2: Firm FE only, no year FE — lets national budget shocks in LOO_t
+         contribute to identification (at cost of absorbing macro confounds).
+    E-3: Over-identified at firm level, firm + year FEs but Z_NSF ⊥ Z_NIH as
+         separate instruments — differential NIH doubling (2000-03) vs flat NSF.
+"""
+print("\n=== Panel E: Alternative FE structures ===")
+
+# ── E-1: Aggregate to state-year ──────────────────────────────────────────────
+# Use lagged firm controls averaged to state-year (one-period lag already baked in)
+CTRL_SY = CTRL_COLS  # same names: ln_sale_lag etc — still valid as state-year means
+_agg_cols = (["scope_increase", "ln_rd_pc", "ln_z_pc", "ln_z_nsf", "ln_z_nih"]
+             + CTRL_SY)
+df_sy = (df.groupby(["state", "year"])[_agg_cols].mean().reset_index().dropna().copy())
+df_sy_p = df_sy.set_index(["state", "year"])
+cl_sy   = pd.Series(df_sy["state"].values, name="state")
+
+r_sy_ols = PanelOLS(
+    df_sy_p["scope_increase"], df_sy_p[["ln_rd_pc"] + CTRL_SY],
+    entity_effects=True, time_effects=True,
+).fit(cov_type="clustered", clusters=cl_sy)
+
+r_sy_fs = PanelOLS(
+    df_sy_p["ln_rd_pc"], df_sy_p[["ln_z_pc"] + CTRL_SY],
+    entity_effects=True, time_effects=True,
+).fit(cov_type="clustered", clusters=cl_sy)
+sy_F = float(r_sy_fs.tstats["ln_z_pc"]) ** 2
+
+r_sy_fs_ovid = PanelOLS(
+    df_sy_p["ln_rd_pc"], df_sy_p[["ln_z_nsf", "ln_z_nih"] + CTRL_SY],
+    entity_effects=True, time_effects=True,
+).fit(cov_type="clustered", clusters=cl_sy)
+sy_F_nsf = float(r_sy_fs_ovid.tstats["ln_z_nsf"]) ** 2
+sy_F_nih = float(r_sy_fs_ovid.tstats["ln_z_nih"]) ** 2
+
+# FWL-IV at state-year level
+absorb_sy   = pd.DataFrame({"state": pd.Categorical(df_sy["state"]),
+                             "year":  pd.Categorical(df_sy["year"].astype(str))})
+cl_abs_sy   = df_sy["state"].astype("category")
+
+def _resid_sy(col):
+    ones = pd.Series(np.ones(len(df_sy)), index=df_sy.index, name="_c")
+    r = AbsorbingLS(df_sy[col], ones, absorb=absorb_sy).fit()
+    return pd.Series(r.resids.values.ravel(), index=df_sy.index, name=col)
+
+y_sy  = _resid_sy("scope_increase")
+x_sy  = _resid_sy("ln_rd_pc")
+z_sy  = _resid_sy("ln_z_pc")
+C_sy  = pd.concat([_resid_sy(c) for c in CTRL_SY], axis=1)
+r_sy_iv = IV2SLS(y_sy, C_sy, x_sy.to_frame(), z_sy.to_frame()
+                 ).fit(cov_type="clustered", clusters=cl_abs_sy)
+
+zn_sy  = _resid_sy("ln_z_nsf")
+zh_sy  = _resid_sy("ln_z_nih")
+Z2_sy  = pd.concat([zn_sy, zh_sy], axis=1)
+r_sy_iv_ovid = IV2SLS(y_sy, C_sy, x_sy.to_frame(), Z2_sy
+                      ).fit(cov_type="clustered", clusters=cl_abs_sy)
+
+print_result(r_sy_ols,      "E-1 OLS   [State+Year FE, state-year level]")
+print_result(r_sy_fs,       f"E-1 FS    [State+Year FE]  F={sy_F:.1f}")
+print_result(r_sy_iv,       "E-1 2SLS  [State+Year FE, just-ID composite Z]")
+print_result(r_sy_fs_ovid,  f"E-1 FS    [State+Year FE, NSF+NIH]  F_NSF={sy_F_nsf:.1f}  F_NIH={sy_F_nih:.1f}")
+print_result(r_sy_iv_ovid,  "E-1 2SLS  [State+Year FE, over-ID NSF+NIH]")
+try:
+    print(f"  Hansen J p-val (E-1 over-ID): {r_sy_iv_ovid.j_statistic.pval:.3f}")
+except Exception:
+    pass
+
+# ── E-2: Firm FE only, no year FE ─────────────────────────────────────────────
+r_noy_ols = PanelOLS(
+    df_p["scope_increase"], df_p[["ln_rd_pc_lag"] + CTRL_COLS],
+    entity_effects=True, time_effects=False,
+).fit(cov_type="clustered", clusters=clusters_p)
+
+r_noy_fs = PanelOLS(
+    df_p["ln_rd_pc_lag"], df_p[["ln_z_pc_lag"] + CTRL_COLS],
+    entity_effects=True, time_effects=False,
+).fit(cov_type="clustered", clusters=clusters_p)
+noy_F = float(r_noy_fs.tstats["ln_z_pc_lag"]) ** 2
+
+absorb_firm = pd.DataFrame({"firm": pd.Categorical(df["gvkey"])})
+r_noy_iv = run_absorbing_iv(df, "scope_increase", "ln_rd_pc_lag", "ln_z_pc_lag",
+                             CTRL_COLS, absorb_firm)
+
+print_result(r_noy_ols, "E-2 OLS  [Firm FE only — no Year FE]")
+print_result(r_noy_fs,  f"E-2 FS   [Firm FE only]  F={noy_F:.1f}")
+print_result(r_noy_iv,  "E-2 2SLS [Firm FE only]")
+
+print(f"\n  Summary — first-stage F statistics:")
+print(f"  Panel A (Firm+Year FE):           {fs_F1:.1f}")
+print(f"  Panel E-1 (State+Year, just-ID):  {sy_F:.1f}")
+print(f"  Panel E-1 (State+Year, NSF+NIH):  F_NSF={sy_F_nsf:.1f}  F_NIH={sy_F_nih:.1f}")
+print(f"  Panel E-2 (Firm FE only):         {noy_F:.1f}")
 
 
 " Save coefficient tables "
@@ -576,6 +594,52 @@ print(f"\nCoefficient table -> {out_csv}")
 print("\nKey treatment coefficients:")
 key = coef_tables[coef_tables["variable"].isin(["ln_rd_pc_lag", "ln_rd_pct_gsp_lag"])]
 print(key[["spec", "variable", "coef", "se", "tstat", "pval"]].to_string(index=False))
+
+
+def write_reg_tex(res_tuple, treat_var, instr_var, treat_tex, dv_fs_tex, tex_path):
+    """Write 8-column regression table: OLS(1,2), FS(3,4), 2SLS(5,6), RF(7,8)."""
+    r_ols1, r_ols2, r_fs1, r_fs2, r_iv1, r_iv2, r_rf1, r_rf2, fsF1, fsF2 = res_tuple
+    RES = [r_ols1, r_ols2, r_fs1, r_fs2, r_iv1, r_iv2, r_rf1, r_rf2]
+    instr_tex = INSTR_LABELS.get(instr_var, f"{instr_var}")
+    ROW_VARS = {treat_var: treat_tex, instr_var: instr_tex, **CTRL_LABELS}
+    with open(tex_path, "w") as fh:
+        fh.write(
+            f"% {os.path.basename(tex_path)} -- auto-generated\n"
+            "\\begin{tabular}{lcccccccc}\n"
+            "\\toprule\n"
+            " & \\multicolumn{2}{c}{OLS} & \\multicolumn{2}{c}{First Stage}"
+            " & \\multicolumn{2}{c}{2SLS} & \\multicolumn{2}{c}{Reduced Form} \\\\\n"
+            "\\cmidrule(lr){2-3}\\cmidrule(lr){4-5}\\cmidrule(lr){6-7}\\cmidrule(lr){8-9}\n"
+            " & (1) & (2) & (3) & (4) & (5) & (6) & (7) & (8) \\\\\n"
+            f"\\textit{{Dep. var.}}"
+            f" & $\\mathbf{{1}}$[ScopeInc] & $\\mathbf{{1}}$[ScopeInc]"
+            f" & {dv_fs_tex} & {dv_fs_tex}"
+            f" & $\\mathbf{{1}}$[ScopeInc] & $\\mathbf{{1}}$[ScopeInc]"
+            f" & $\\mathbf{{1}}$[ScopeInc] & $\\mathbf{{1}}$[ScopeInc] \\\\\n"
+            "\\midrule\n"
+        )
+        for var, label in ROW_VARS.items():
+            fh.write(tex_row(label, [fmt_tex(r, var) for r in RES]))
+        fh.write(
+            "\\midrule\n"
+            f"Observations  & {int(r_ols1.nobs):,} & {int(r_ols2.nobs):,}"
+            f" & {int(r_fs1.nobs):,} & {int(r_fs2.nobs):,}"
+            f" & {int(r_iv1.nobs):,} & {int(r_iv2.nobs):,}"
+            f" & {int(r_rf1.nobs):,} & {int(r_rf2.nobs):,} \\\\\n"
+            f"Within-R$^2$  & {r_ols1.rsquared:.3f} & {r_ols2.rsquared:.3f}"
+            f" & {r_fs1.rsquared:.3f} & {r_fs2.rsquared:.3f} & &"
+            f" & {r_rf1.rsquared:.3f} & {r_rf2.rsquared:.3f} \\\\\n"
+            f"First-stage $F$ & & & & & {fsF1:.1f} & {fsF2:.1f} & & \\\\\n"
+            "Firm FE & \\checkmark & \\checkmark & \\checkmark & \\checkmark"
+            " & \\checkmark & \\checkmark & \\checkmark & \\checkmark \\\\\n"
+            "Year FE & \\checkmark & & \\checkmark & & \\checkmark & & \\checkmark & \\\\\n"
+            "Industry $\\times$ Year FE & & \\checkmark & & \\checkmark & & \\checkmark & & \\checkmark \\\\\n"
+            "Clustered SE & State & State & State & State & State & State & State & State \\\\\n"
+            "\\bottomrule\n"
+            "\\end{tabular}\n"
+        )
+    print(f"LaTeX table -> {tex_path}")
+
 
 write_reg_tex(
     res_A, "ln_rd_pc_lag", "ln_z_pc_lag",
@@ -678,8 +742,8 @@ for seg_dep, seg_tex, seg_fname in SEG_OUTCOMES:
 
 """ Local Projections: OLS impulse response at horizons h = 1 to 5
     For each h, estimate:
-        d2vscope_{i,t+h} = beta_h * ln(rd_pc)_{i,t} + X_{i,t} + alpha_i + gamma_t + e
-    Treatment is ln_rd_pc at year t (not lagged); outcomes are h-year-ahead scope.
+        scope_increase_{i,t+h} = beta_h * ln(rd_pc)_{i,t} + X_{i,t} + alpha_i + gamma_t + e
+    Treatment is ln_rd_pc at year t (not lagged); outcomes are h-year-ahead scope_increase.
     Spec 1: Firm + Year FE  |  Spec 2: Firm + Industry×Year FE
 """
 HORIZONS = range(1, 6)
@@ -687,10 +751,14 @@ HORIZONS = range(1, 6)
 # LP controls are contemporaneous (treatment and controls both at time t)
 LP_CTRL_COLS = ["ln_sale", "rd_intensity", "roa", "leverage", "cash_ratio", "ln_gsp_pc"]
 
-# Create forward leads of d2vscope within firm
+# Create cumulative scope increase at each horizon: 1[d2vscope_{t+h} > d2vscope_t]
+# This is the LP analog of a cumulative impulse response — did scope end up higher
+# at t+h than at t, rather than whether it happened to increase in that specific year.
 df_lp = df.copy()
 for h in HORIZONS:
-    df_lp[f"scope_fwd_{h}"] = df_lp.groupby("gvkey")["d2vscope"].shift(-h)
+    df_lp[f"scope_fwd_{h}"] = (
+        df_lp.groupby("gvkey")["d2vscope"].shift(-h) > df_lp["d2vscope"]
+    ).astype(float)
 
 lp_res1 = {}   # Spec 1: Firm + Year FE
 lp_res2 = {}   # Spec 2: Firm + Ind×Year FE
@@ -755,8 +823,8 @@ for lp_res, label, color, ls in [
 
 ax.axhline(0, color="black", linewidth=0.8, linestyle=":")
 ax.set_xlabel("Horizon h (years)")
-ax.set_ylabel(r"$\beta_h$: effect of $\ln$(R\&D/pop)$_t$ on d2vscope$_{t+h}$")
-ax.set_title("Local Projection — R&D Funding → Firm Scope (OLS)")
+ax.set_ylabel(r"$\beta_h$: effect of $\ln$(R\&D/pop)$_t$ on Pr(scope$_{t+h}$ > scope$_t$)")
+ax.set_title("Local Projection — R&D Funding → Pr(Scope Increase) (OLS)")
 ax.set_xticks(hs)
 ax.legend(frameon=False)
 fig.tight_layout()
@@ -774,7 +842,7 @@ with open(lp_tex, "w") as fh:
         "\\toprule\n"
         " & \\multicolumn{5}{c}{Horizon $h$ (years ahead)} \\\\\n"
         "\\cmidrule(lr){2-6}\n"
-        "Dep.\\ var: d2vscope$_{t+h}$ & $h=1$ & $h=2$ & $h=3$ & $h=4$ & $h=5$ \\\\\n"
+        "Dep.\\ var: $\\mathbf{1}$[scope$_{t+h}>$scope$_t$] & $h=1$ & $h=2$ & $h=3$ & $h=4$ & $h=5$ \\\\\n"
         "\\midrule\n"
     )
     for spec_label, lp_res in [("\\textit{Firm + Year FE}", lp_res1),
