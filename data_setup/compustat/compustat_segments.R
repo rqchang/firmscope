@@ -57,9 +57,12 @@ source("utils/setPaths.R")
 # ================================================================= #
 seg <- readRDS(paste0(RAWDIR, "Compustat/compustat_segments.rds"))
 
-seg[, fyear := as.integer(format(as.Date(datadate), "%Y"))]
+if(any(duplicated(seg[, .(gvkey, datadate, sid)]))){
+  stop('Data primary key violated.')
+}
 
-seg_count <- seg[!is.na(sales) | !is.na(sid)]
+seg[, fyear := as.integer(format(as.Date(datadate), "%Y"))]
+seg_count <- seg[!is.na(sid)]
 seg_hhi   <- seg[!is.na(sales) & sales > 0]
 
 
@@ -72,23 +75,21 @@ n_seg <- seg_count[, .(n_segments = uniqueN(sid)), by = .(gvkey, fyear)]
 # --- 2. Segment HHI from revenue shares ---
 seg_hhi[, seg_sales_tot := sum(sales, na.rm = TRUE), by = .(gvkey, fyear)]
 seg_hhi[seg_sales_tot > 0, share := sales / seg_sales_tot]
-hhi   <- seg_hhi[, .(seg_hhi       = sum(share^2,   na.rm = TRUE),
-                     seg_sales_tot = first(seg_sales_tot)),
-                 by = .(gvkey, fyear)]
+hhi <- seg_hhi[, .(seg_hhi = sum(share^2, na.rm = TRUE),
+                   seg_sales_tot = first(seg_sales_tot)),
+               by = .(gvkey, fyear)]
 
 # --- 3. Merge and derive diversity index ---
 firm_yr <- merge(n_seg, hhi, by = c("gvkey", "fyear"), all.x = TRUE)
 firm_yr[, seg_diversity := 1 - seg_hhi]
-
-firm_yr[n_segments == 1 & is.na(seg_hhi),
-        ":="(seg_hhi = 1, seg_diversity = 0)]
-
-firm_yr <- firm_yr[order(gvkey, fyear)]
+firm_yr[n_segments == 1 & is.na(seg_hhi), ":="(seg_hhi = 1, seg_diversity = 0)]
 
 
 # ================================================================= #
 # Check ####
 # ================================================================= #
+firm_yr <- firm_yr[order(gvkey, fyear)]
+
 print(sprintf(
   "Segment panel: %d firm-year obs, %d unique gvkeys, years %d-%d.",
   nrow(firm_yr),
@@ -106,5 +107,10 @@ print(summary(firm_yr$seg_diversity))
 # ================================================================= #
 # Write ####
 # ================================================================= #
-fwrite(firm_yr, paste0(PROCDIR, "Compustat/compustat_segments_annual.csv"))
+fwrite(firm_yr, paste0(PROCDIR, "Compustat/segments_annual.csv"))
 print("Segment firm-year panel saved.")
+
+
+
+
+
