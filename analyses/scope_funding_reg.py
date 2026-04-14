@@ -18,11 +18,21 @@ FEs:  firm (gvkey) + industry x year (2-digit NAICS from naicsh_filled)
       technology cycles that may correlate with state funding patterns.
 SEs:  clustered by state (treatment variation is at state-year level)
 
+State assignment:
+    Firms are linked to states via their time-varying HQ/operational state
+    (crsp.comphist hstate), NOT the Compustat state of incorporation.
+    Compustat's state field on funda is the incorporation state — ~65% of
+    large public firms are incorporated in Delaware regardless of operations.
+    Using the HQ state eliminates the DE/NV incorporation-haven misclassification
+    that would attenuate estimates and introduce systematic bias.
+    Source: data_setup/compustat/assign_loc.py → firm_location_panel.csv
+
 Data inputs:
-    data/raw/scope/FirmScope.txt                      Hoberg-Phillips scope
-    data/processed/Compustat/compustat_annual.csv     financials + state abbreviation
-    data/processed/eip/funding_panel.csv              state-year R&D panel
-    data/processed/eip/bartik_shares.csv              pre-determined Bartik shares
+    data/raw/scope/FirmScope.txt                        Hoberg-Phillips scope
+    data/processed/Compustat/compustat_annual.csv       financials
+    data/processed/Compustat/firm_location_panel.csv    time-varying HQ + incorp state
+    data/processed/eip/funding_panel.csv                state-year R&D panel
+    data/processed/eip/bartik_shares.csv                pre-determined Bartik shares
 """
 
 import os
@@ -48,12 +58,17 @@ scope = pd.read_csv(os.path.join(RAW_SCOPE, "FirmScope.txt"), sep="\t")
 scope["gvkey"] = scope["gvkey"].astype(str).str.zfill(6)
 # year == first 4 digits of Compustat datadate (fiscal year end year)
 
-" Compustat annual financials + state "
+" Compustat annual financials "
 comp = pd.read_csv(os.path.join(PROC_CS, "compustat_annual.csv"), dtype={"gvkey": str})
 comp["gvkey"] = comp["gvkey"].str.zfill(6)
 comp = comp.rename(columns={"fyear": "year"})
 comp["year"] = comp["year"].astype("Int64")
-comp = comp[["gvkey", "year", "sale", "at", "xrd", "oibdp", "fdat", "che", "sic", "naicsh_filled", "state"]].dropna(subset=["state"]).copy()
+comp = comp[["gvkey", "year", "sale", "at", "xrd", "oibdp", "fdat", "che", "sic", "naicsh_filled"]].copy()
+
+" Time-varying firm location: HQ state (operational) + state of incorporation "
+loc = pd.read_csv(os.path.join(PROC_CS, "firm_location_panel.csv"), dtype={"gvkey": str})
+loc["gvkey"] = loc["gvkey"].str.zfill(6)
+loc["year"]  = loc["year"].astype("Int64")
 
 " Segment-based firm scope (Compustat seg_ann) "
 seg = pd.read_csv(os.path.join(PROC_CS, "compustat_segments_annual.csv"), dtype={"gvkey": str})
@@ -140,6 +155,15 @@ state_yr["bartik_z_nih_pc"]  = state_yr["share_nih"] * state_yr["loo_nih"] / _po
 
 " Merge to firm-year panel "
 df = pd.merge(scope, comp, on=["gvkey", "year"], how="inner")
+
+# Attach time-varying HQ state and state of incorporation.
+# hq_state  → renamed to 'state' so all downstream code is unchanged.
+# incorp_state → retained for robustness checks (DE/NV haven exclusion etc.).
+df = pd.merge(df, loc[["gvkey", "year", "hq_state", "incorp_state"]],
+              on=["gvkey", "year"], how="left")
+df = df.rename(columns={"hq_state": "state"})
+df = df.dropna(subset=["state"]).copy()   # drop firms with no HQ-state record
+
 df = pd.merge(df, state_yr[["state", "year", "rd_funding_per_capita", "rd_funding_pct_gsp",
                             "bartik_z", "bartik_z_pc", "bartik_z_pct_gsp",
                             "bartik_z_nsf_pc", "bartik_z_nih_pc",

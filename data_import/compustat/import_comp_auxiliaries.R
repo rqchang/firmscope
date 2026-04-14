@@ -64,6 +64,14 @@ wrds <- dbConnect(Postgres(),
 print('Successfully started downloading compustat auxiliaries from WRDS.')
 
 # Import and Save Names Table ####
+vars <- dbGetQuery(wrds, "
+  SELECT column_name
+  FROM information_schema.columns
+  WHERE table_schema = 'crsp'
+    AND table_name = 'comphist'
+  ORDER BY column_name
+")
+
 comp_histnames <- dbGetQuery(wrds,"SELECT * from crsp.comphist")
 
 # Download Compustat names table: get sic/naics code (most recent one) ####
